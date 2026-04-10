@@ -1,0 +1,7 @@
+data
+pysot
+demo/*.mp4
+eval_results/*.json
+exported/*.onnx
+pretrained/*.pth
+report/*
