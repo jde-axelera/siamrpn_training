@@ -741,9 +741,10 @@ def build_optimizer(model):
 def run_epoch(model, loader, device, optimizer=None, epoch=0):
     training = optimizer is not None
     model.train() if training else model.eval()
+    raw_model = model.module if isinstance(model, nn.DataParallel) else model
 
     if training and epoch < cfg.BACKBONE.TRAIN_EPOCH:
-        for m in model.backbone.modules():
+        for m in raw_model.backbone.modules():
             if isinstance(m, nn.BatchNorm2d):
                 m.eval()
 
