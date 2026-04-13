@@ -47,11 +47,15 @@ SMOKE_TEST=false
 for arg in "$@"; do
     case "${arg}" in
         --smoke-test) SMOKE_TEST=true ;;
+        --install-dir=*) INSTALL_DIR="${arg#*=}" ;;
         --help|-h)
-            echo "Usage: $0 [--smoke-test]"
+            echo "Usage: $0 [--smoke-test] [--install-dir=DIR]"
             echo ""
             echo "  (no flags)    Full training run (500 epochs)"
-            echo "  --smoke-test  1-epoch pipeline check — fast, no real training"
+            echo "  --smoke-test       1-epoch pipeline check — fast, no real training"
+            echo "  --install-dir=DIR  Install conda/data/outputs under DIR instead of HOME"
+            echo "                     Useful when the root partition is small (e.g. AWS /dev/root)"
+            echo "                     Example: ./run_aws_training.sh --install-dir=/data"
             exit 0
             ;;
         *)
@@ -65,7 +69,14 @@ done
 # ─────────────────────────────────────────────────────────────────────────────
 # CONFIGURABLE VARIABLES — edit these before running
 # ─────────────────────────────────────────────────────────────────────────────
-WORK_DIR="${HOME}/siamrpn_training"
+# Install location — override via --install-dir=DIR or by setting INSTALL_DIR env var
+# Default is $HOME; set to a data partition when root is limited (e.g. AWS instances)
+INSTALL_DIR="${INSTALL_DIR:-${HOME}}"
+export PIP_CACHE_DIR="${INSTALL_DIR}/pip_cache"
+export CONDA_PKGS_DIRS="${INSTALL_DIR}/conda_pkgs"
+export TORCH_HOME="${INSTALL_DIR}/torch_cache"
+mkdir -p "${PIP_CACHE_DIR}" "${CONDA_PKGS_DIRS}" "${TORCH_HOME}"
+WORK_DIR="${INSTALL_DIR}/siamrpn_training"
 EPOCHS=500
 BATCH_SIZE=32
 NUM_WORKERS=8
@@ -213,16 +224,16 @@ banner "Step 1/13 — Conda bootstrap"
 # =============================================================================
 log "Checking for Conda..."
 # Activate conda if it exists but is not yet in PATH (non-login shells)
-if [ -f "${HOME}/miniconda3/bin/conda" ]; then
-    eval "$("${HOME}/miniconda3/bin/conda" shell.bash hook)"
+if [ -f "${INSTALL_DIR}/miniconda3/bin/conda" ]; then
+    eval "$("${INSTALL_DIR}/miniconda3/bin/conda" shell.bash hook)"
 elif [ -f "/opt/conda/bin/conda" ]; then
     eval "$(/opt/conda/bin/conda shell.bash hook)"
 fi
 if ! command -v conda &>/dev/null; then
     log "Installing Miniconda..."
     wget -q https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -O /tmp/miniconda.sh
-    bash /tmp/miniconda.sh -b -p "${HOME}/miniconda3"
-    eval "$("${HOME}/miniconda3/bin/conda" shell.bash hook)"
+    bash /tmp/miniconda.sh -b -p "${INSTALL_DIR}/miniconda3"
+    eval "$("${INSTALL_DIR}/miniconda3/bin/conda" shell.bash hook)"
     conda init bash
 else
     log "Conda already available: $(conda --version)"

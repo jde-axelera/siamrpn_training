@@ -302,6 +302,32 @@ siamrpn_training/
 
 ---
 
+## Running on a Limited Root Partition
+
+AWS instances often have a small root volume (8–30 GB) that fills up quickly once
+PyTorch, datasets, and checkpoints are installed. Use `--install-dir` to redirect
+**everything** — Miniconda, conda packages, pip cache, datasets, checkpoints, and
+exported models — to a larger data volume:
+
+```bash
+./run_aws_training.sh --install-dir=/data
+```
+
+This sets the following automatically:
+- Miniconda installed to `/data/miniconda3`
+- `WORK_DIR` = `/data/siamrpn_training`
+- `PIP_CACHE_DIR` = `/data/pip_cache`
+- `CONDA_PKGS_DIRS` = `/data/conda_pkgs`
+- `TORCH_HOME` = `/data/torch_cache`
+
+You can also set `INSTALL_DIR` as an environment variable before running:
+
+```bash
+export INSTALL_DIR=/data
+./run_aws_training.sh
+```
+
+
 ## Related
 
 - [PySOT](https://github.com/STVIR/pysot) — base tracking framework
