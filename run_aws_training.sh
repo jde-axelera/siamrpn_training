@@ -456,7 +456,7 @@ if [ "${MASSMIND_READY}" = false ]; then
     # Images
     log "  [1/3] Downloading LWIR images..."
     ${PYTHON} -m gdown "${MASSMIND_IMAGES_GDRIVE_ID}" \
-        -O "${DATA_MASSMIND}/massmind_images.zip" --fuzzy
+        -O "${DATA_MASSMIND}/massmind_images.zip"
     log "  Extracting images..."
     unzip -q "${DATA_MASSMIND}/massmind_images.zip" -d "${DATA_MASSMIND}/images"
     rm -f "${DATA_MASSMIND}/massmind_images.zip"
@@ -464,7 +464,7 @@ if [ "${MASSMIND_READY}" = false ]; then
     # Semantic segmentation masks
     log "  [2/3] Downloading semantic segmentation masks..."
     ${PYTHON} -m gdown "${MASSMIND_MASKS_GDRIVE_ID}" \
-        -O "${DATA_MASSMIND}/massmind_masks.zip" --fuzzy
+        -O "${DATA_MASSMIND}/massmind_masks.zip"
     log "  Extracting semantic masks..."
     unzip -q "${DATA_MASSMIND}/massmind_masks.zip" -d "${DATA_MASSMIND}/masks"
     rm -f "${DATA_MASSMIND}/massmind_masks.zip"
@@ -472,7 +472,7 @@ if [ "${MASSMIND_READY}" = false ]; then
     # Instance segmentation masks (used for bbox annotation conversion)
     log "  [3/3] Downloading instance segmentation masks..."
     ${PYTHON} -m gdown "${MASSMIND_INSTANCE_GDRIVE_ID}" \
-        -O "${DATA_MASSMIND}/massmind_instance.zip" --fuzzy
+        -O "${DATA_MASSMIND}/massmind_instance.zip"
     log "  Extracting instance masks..."
     unzip -q "${DATA_MASSMIND}/massmind_instance.zip" -d "${DATA_MASSMIND}/instance_masks"
     rm -f "${DATA_MASSMIND}/massmind_instance.zip"
@@ -522,7 +522,7 @@ if [ ! -d "${DATA_MVSS}/sequences" ]; then
         "${DATA_MVSS}/sequences"; then
         log "  Attempting auto-download (succeeds only if access was granted)..."
         if ${PYTHON} -m gdown "${MVSS_GDRIVE_ID}" \
-                -O "${DATA_MVSS}/mvseg.zip" --fuzzy 2>/dev/null; then
+                -O "${DATA_MVSS}/mvseg.zip" 2>/dev/null; then
             log "  Download succeeded. Extracting..."
             unzip -q "${DATA_MVSS}/mvseg.zip" -d "${DATA_MVSS}/sequences"
             rm -f "${DATA_MVSS}/mvseg.zip"
@@ -599,10 +599,10 @@ if ask_download \
 if [ ! -d "${DATA_DUTANTIUAV}/images" ]; then
     log "  Downloading DUT-Anti-UAV tracking images..."
     ${PYTHON} -m gdown "${DUTANTIUAV_IMAGES_ID}" \
-        -O "${DATA_DUTANTIUAV}/images.zip" --fuzzy
+        -O "${DATA_DUTANTIUAV}/images.zip"
     log "  Downloading ground truth annotations..."
     ${PYTHON} -m gdown "${DUTANTIUAV_GT_ID}" \
-        -O "${DATA_DUTANTIUAV}/gt.zip" --fuzzy
+        -O "${DATA_DUTANTIUAV}/gt.zip"
     log "  Extracting..."
     unzip -q "${DATA_DUTANTIUAV}/images.zip" -d "${DATA_DUTANTIUAV}/images"
     unzip -q "${DATA_DUTANTIUAV}/gt.zip"     -d "${DATA_DUTANTIUAV}/gt"
@@ -640,7 +640,7 @@ else
     if [ -n "${ANTIUAV300_GDRIVE_ID}" ]; then
         log "  Downloading Anti-UAV300 from Google Drive..."
         ${PYTHON} -m gdown "${ANTIUAV300_GDRIVE_ID}" \
-            -O "${DATA_ANTIUAV300}/antiuav300.zip" --fuzzy
+            -O "${DATA_ANTIUAV300}/antiuav300.zip"
         unzip -q "${DATA_ANTIUAV300}/antiuav300.zip" -d "${DATA_ANTIUAV300}"
         rm -f "${DATA_ANTIUAV300}/antiuav300.zip"
         ok "  Anti-UAV300 downloaded."
