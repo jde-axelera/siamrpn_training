@@ -333,3 +333,76 @@ export INSTALL_DIR=/data
 - [PySOT](https://github.com/STVIR/pysot) — base tracking framework
 - [SiamRPN++ (Li et al., CVPR 2019)](https://arxiv.org/abs/1812.11703) — tracker architecture
 - [Axelera Voyager SDK](https://www.axelera.ai) — target deployment platform
+
+
+---
+
+## Downloading DUT-VTUAV Dataset
+
+The DUT-VTUAV dataset is hosted on Google Drive and is too large for `gdown` due to quota limits. Use `rclone` to download it directly to the machine at full network speed.
+
+### 1. Install rclone
+
+```bash
+curl https://rclone.org/install.sh | sudo bash
+```
+
+### 2. Authenticate with Google Drive
+
+On a machine with a browser (your laptop), run:
+
+```bash
+rclone authorize "drive"
+```
+
+This opens a browser — sign in with your Google account, allow access, then copy the JSON token that appears in the terminal.
+
+### 3. Configure rclone on the server
+
+On the server (headless), run:
+
+```bash
+rclone config
+```
+
+Answer the prompts:
+```
+n                  # New remote
+gdrive             # Name
+drive              # Storage type: Google Drive
+                   # client_id → Enter (blank)
+                   # client_secret → Enter (blank)
+1                  # scope: full drive access
+                   # root_folder_id → Enter (blank)
+                   # service_account_file → Enter (blank)
+n                  # Edit advanced config? No
+n                  # Use auto config? No  (headless server)
+```
+
+Paste the JSON token from Step 2 when prompted, then:
+```
+y                  # Confirm
+q                  # Quit config
+```
+
+### 4. Download train split only
+
+```bash
+rclone copy --drive-root-folder-id 1GwYNPcrkUM-gVDAObxNqERi_2Db7okjP --include "train_*/**" --progress --transfers 8 gdrive: /data/dut_vtuav_raw/
+```
+
+- `--drive-root-folder-id` — pins rclone to the DUT-VTUAV shared folder directly
+- `--include "train_*/**"` — downloads only `train_*` folders, skipping test splits
+- `--transfers 8` — 8 parallel file downloads (increase on fast connections)
+
+To download everything including test splits:
+
+```bash
+rclone copy --drive-root-folder-id 1GwYNPcrkUM-gVDAObxNqERi_2Db7okjP --progress --transfers 8 gdrive: /data/dut_vtuav_raw/
+```
+
+### 5. Monitor download progress
+
+```bash
+watch -n 10 "du -sh /data/dut_vtuav_raw/"
+```
