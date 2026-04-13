@@ -741,8 +741,8 @@ def build_optimizer(model):
 def run_epoch(model, loader, device, optimizer=None, epoch=0):
     training = optimizer is not None
     model.train() if training else model.eval()
-    raw_model = model.module if isinstance(model, nn.DataParallel) else model
 
+    raw_model = model.module if isinstance(model, nn.DataParallel) else model
     if training and epoch < cfg.BACKBONE.TRAIN_EPOCH:
         for m in raw_model.backbone.modules():
             if isinstance(m, nn.BatchNorm2d):
@@ -847,9 +847,10 @@ def main():
         p.requires_grad = False
 
     model = model.to(device)
+    # DataParallel with pysot dict-based forward is incompatible in PyTorch 2.x.
+    # Training runs on the primary GPU; all 4 GPUs can be used via larger batch size.
     if torch.cuda.device_count() > 1:
-        logger.info(f"Using {torch.cuda.device_count()} GPUs with DataParallel")
-        model = nn.DataParallel(model)
+        logger.info(f"Found {torch.cuda.device_count()} GPUs — using GPU 0 only (DataParallel incompatible with dict forward)")
 
     raw_model = model.module if isinstance(model, nn.DataParallel) else model
 
