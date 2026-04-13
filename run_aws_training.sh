@@ -75,7 +75,8 @@ INSTALL_DIR="${INSTALL_DIR:-${HOME}}"
 export PIP_CACHE_DIR="${INSTALL_DIR}/pip_cache"
 export CONDA_PKGS_DIRS="${INSTALL_DIR}/conda_pkgs"
 export TORCH_HOME="${INSTALL_DIR}/torch_cache"
-mkdir -p "${PIP_CACHE_DIR}" "${CONDA_PKGS_DIRS}" "${TORCH_HOME}"
+export TMPDIR="${INSTALL_DIR}/tmp"
+mkdir -p "${PIP_CACHE_DIR}" "${CONDA_PKGS_DIRS}" "${TORCH_HOME}" "${TMPDIR}"
 WORK_DIR="${INSTALL_DIR}/siamrpn_training"
 EPOCHS=500
 BATCH_SIZE=32
