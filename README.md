@@ -274,12 +274,19 @@ At batch size 32 this gives **≈ 312 gradient steps per epoch**, independent of
 
 Probabilities are non-proportional — smaller, task-critical IR-specific datasets are upweighted to ensure the model sees balanced examples across object scales and thermal conditions:
 
-| Dataset | Sequences | `sample_prob` | Rationale |
-|---------|-----------|--------------|-----------|
-| AntiUAV410 | 200 | 0.316 | Primary target — IR drone tracking, highest priority |
-| DUT-VTUAV | 225 | 0.263 | Large-scale multi-category UAV, good diversity |
-| MSRS | 541 | 0.105 | Paired IR/visible — ground-level object variety |
-| MassMIND | 1,801 | 0.105 | Maritime domain — downweighted despite large size |
+| Dataset | Sequences | Config weight | `sample_prob`* | Rationale |
+|---------|-----------|--------------|----------------|-----------|
+| AntiUAV410 | 200 | 3.0 | 0.400 | Primary target — IR drone tracking, highest priority |
+| DUT-VTUAV | 225 | 2.5 | 0.333 | Large-scale multi-category UAV, good diversity |
+| MSRS | 541 | 1.0 | 0.133 | Paired IR/visible — ground-level object variety |
+| MassMIND | 1,801 | 1.0 | 0.133 | Maritime domain — downweighted despite large size |
+| VT-MOT | 582 | 2.0 | — | Active if annotation present; IR multi-object diversity |
+| MVSS | — | 1.5 | — | Active if annotation present |
+| Anti-UAV300 | — | 2.5 | — | Active if annotation present; same domain as AntiUAV410 |
+| BIRDSAI | 48 | 1.5 | — | Active if annotation present; aerial wildlife thermal |
+| HIT-UAV | 2,898 | 1.0 | — | Active if annotation present; high-altitude detection |
+
+\* `sample_prob` shown for the 4 currently active datasets. Weights renormalise automatically over whatever datasets have annotation files present.
 
 ### Hyperparameters
 

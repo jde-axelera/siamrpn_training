@@ -1,12 +1,26 @@
 """
-SiamRPN++ finetuning on Anti-UAV410 for AWS (CUDA multi-GPU).
+train_siamrpn_aws.py  —  SiamRPN++ fine-tuning on IR/thermal datasets
+======================================================================
+Trains on a weighted combination of 9 IR/thermal datasets (Anti-UAV410,
+MSRS, VT-MOT, MassMIND, MVSS, DUT-VTUAV, Anti-UAV300, BIRDSAI, HIT-UAV).
+Datasets missing their annotation JSON are skipped automatically.
+
 Features:
-  - Multi-GPU via DataParallel
-  - Cosine LR with linear warmup
-  - Validation loss after every epoch
-  - Best-model checkpoint (lowest val loss)
-  - Resume from checkpoint
+  - Stochastic pair sampling: 10,000 (template, search) pairs per epoch
+  - Warmup (5 ep) → SGDR cosine annealing (T0=50, T_mult=2)
+  - ReduceLROnPlateau rescue (×0.3 after 15 stagnant epochs)
+  - Backbone frozen for first 10 epochs, then fine-tuned at 0.1× LR
+  - Early stopping: patience=50, relative delta=1e-4
+  - Validation loss after every epoch; best checkpoint saved
+  - Resume from any checkpoint
   - TensorBoard logging
+
+Usage
+-----
+  conda activate pysot
+  python train_siamrpn_aws.py \
+      --cfg  pysot/experiments/siamrpn_r50_alldatasets/config.yaml \
+      --pretrained pretrained/sot_resnet50.pth
 """
 from __future__ import absolute_import, division, print_function, unicode_literals
 
@@ -388,31 +402,6 @@ class DUTVTUAVDataset(IRTrackingDatasetBase):
                 return p
         return None
 
-
-# ── DUT-Anti-UAV dataset (IR drone tracking) ─────────────────────────────────
-class DUTAntiUAVDataset(IRTrackingDatasetBase):
-    """
-    DUT-Anti-UAV: images/<seq>/<frame>.jpg, gt/<seq>_gt.txt.
-    Handles both flat (images/video01/) and wrapped (images/Anti-UAV-Tracking-V0/video01/)
-    layouts by probing one wrapper level on init if direct path doesn't exist.
-    """
-    def __init__(self, root, anno_path, frame_range=30, epoch_len=None):
-        # Auto-detect wrapper subdir so seq names resolve correctly
-        if os.path.isdir(root):
-            top = [e for e in sorted(os.listdir(root))
-                   if os.path.isdir(os.path.join(root, e))]
-            if top:
-                first = os.path.join(root, top[0])
-                if any(os.path.isdir(os.path.join(first, c)) for c in os.listdir(first)):
-                    root = first   # unwrap one level
-        super().__init__(root, anno_path, frame_range, epoch_len, name="DUT-Anti-UAV")
-
-    def _find_image(self, seq, frame_id):
-        for ext in (".jpg", ".png"):
-            p = os.path.join(self.root, seq, f"{frame_id:06d}{ext}")
-            if os.path.isfile(p):
-                return p
-        return None
 
 
 # ── Anti-UAV 300 dataset ──────────────────────────────────────────────────────
