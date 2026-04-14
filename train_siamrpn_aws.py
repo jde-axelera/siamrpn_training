@@ -1077,8 +1077,8 @@ def main():
             logger.info("=" * 60)
 
         # ── step primary schedule (warmup → SGDR) ─────────────────────────────
-        lr_before = optimizer.param_groups[0]["lr"]
         lr = primary_sched.step(epoch)
+        lr_before = optimizer.param_groups[0]["lr"]  # after warmup/SGDR — plateau detection only
 
         train_loss = run_epoch(model, train_loader, device, optimizer, epoch)
         val_loss   = run_epoch(model, val_loader,   device, optimizer=None, epoch=epoch)
