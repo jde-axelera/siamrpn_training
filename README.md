@@ -74,6 +74,26 @@ All dataset annotations are automatically converted to a unified **PySOT JSON fo
 ```
 Conversions handle: MOT `gt.txt` → per-object SOT tracks, instance segmentation masks → bounding boxes, YOLO normalised coords → pixel coordinates, MP4 video → frame extraction.
 
+### Dataset Annotation Samples
+
+Sample IR frames with ground-truth bounding boxes from each training dataset (4 sequences × 4 frames each — see [`report/datasets_annotation_check.pdf`](report/datasets_annotation_check.pdf) for the full report):
+
+**Anti-UAV 410** — IR UAV tracking
+![Anti-UAV 410](docs/ds_strip_Anti_UAV_410.jpg)
+
+**MSRS** — Paired IR/visible road scenes
+![MSRS](docs/ds_strip_MSRS.jpg)
+
+**MassMIND** — Maritime LWIR
+![MassMIND](docs/ds_strip_MassMIND.jpg)
+
+**DUT-VTUAV** — RGB+Thermal UAV
+![DUT-VTUAV](docs/ds_strip_DUT_VTUAV.jpg)
+
+**DUT-Anti-UAV** — IR drone tracking
+![DUT-Anti-UAV](docs/ds_strip_DUT_Anti_UAV.jpg)
+
+
 ---
 
 ## Requirements
