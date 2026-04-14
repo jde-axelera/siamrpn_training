@@ -1031,7 +1031,11 @@ def convert_dutvtuav(data_root, split="train"):
                 x, y, w, h = float(vals[0]), float(vals[1]), float(vals[2]), float(vals[3])
                 if w <= 0 or h <= 0:
                     continue
-                frames[f"{i+1:06d}"] = [x, y, x + w, y + h]
+                # DUT-VTUAV: annotations at 1fps, video at 10fps → line i = frame i*10
+                frame_num = i * 10
+                fkey = f"{frame_num:06d}"
+                if os.path.isfile(os.path.join(ir_dir, fkey + ".jpg")):
+                    frames[fkey] = [x, y, x + w, y + h]
         if len(frames) > 1:
             annos[seq] = {"0": frames}
     save_json(annos, out, f"DUT-VTUAV/{split}")
