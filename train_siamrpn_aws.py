@@ -18,7 +18,13 @@ Features:
 Usage
 -----
   conda activate pysot
+  # Single GPU:
   python train_siamrpn_aws.py \
+      --cfg  pysot/experiments/siamrpn_r50_alldatasets/config.yaml \
+      --pretrained pretrained/sot_resnet50.pth
+
+  # Multi-GPU (4x T4) via DistributedDataParallel:
+  torchrun --nproc_per_node=4 train_siamrpn_aws.py \
       --cfg  pysot/experiments/siamrpn_r50_alldatasets/config.yaml \
       --pretrained pretrained/sot_resnet50.pth
 """
@@ -1032,8 +1038,9 @@ def main():
 
         # unlock backbone after BACKBONE_TRAIN_EPOCH
         if epoch == cfg.BACKBONE.TRAIN_EPOCH:
-            logger.info("=" * 60)
-            logger.info("Unfreezing backbone layers for fine-grained training.")
+            if is_main:
+                logger.info("=" * 60)
+                logger.info("Unfreezing backbone layers for fine-grained training.")
             for layer_name in cfg.BACKBONE.TRAIN_LAYERS:
                 for p in getattr(raw_model.backbone, layer_name).parameters():
                     p.requires_grad = True
@@ -1055,7 +1062,7 @@ def main():
         lr_after = optimizer.param_groups[0]["lr"]
 
         # Detect and log if plateau scheduler fired (LR changed from its action)
-        if lr_after < lr_before * 0.99:   # more than 1% drop → plateau fired
+        if is_main and lr_after < lr_before * 0.99:
             logger.info(
                 f"  ⚡ [ReduceLROnPlateau] LR reduced: {lr_before:.2e} → {lr_after:.2e}  "
                 f"(val_loss stalled for {plateau_sched.patience} epochs)"
@@ -1067,7 +1074,8 @@ def main():
 
         # ── early stopping check ──────────────────────────────────────────────
         should_stop = early_stopping.step(val_loss)
-        tb_writer.add_scalar("early_stopping/counter", early_stopping.counter, epoch + 1)
+        if is_main:
+            tb_writer.add_scalar("early_stopping/counter", early_stopping.counter, epoch + 1)
 
         # Log epoch summary — include early-stopping counter so it's always visible
         logger.info(
