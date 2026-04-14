@@ -38,6 +38,8 @@ from torch.nn.utils import clip_grad_norm_
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.tensorboard import SummaryWriter
 import cv2
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 
 # ── PySOT on path ─────────────────────────────────────────────────────────────
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -57,11 +59,23 @@ logger = logging.getLogger("train")
 
 
 # ── device helpers ────────────────────────────────────────────────────────────
-def get_device():
+def init_distributed():
+    """Initialize DDP if launched via torchrun. set_device BEFORE init_process_group."""
+    if "RANK" not in os.environ:
+        return 0, 0, 1, True
+    local_rank = int(os.environ["LOCAL_RANK"])
+    torch.cuda.set_device(local_rank)        # MUST be before NCCL init
+    dist.init_process_group(backend="nccl")
+    rank       = dist.get_rank()
+    world_size = dist.get_world_size()
+    return rank, local_rank, world_size, (rank == 0)
+
+
+def get_device(local_rank=0):
     if torch.cuda.is_available():
         n = torch.cuda.device_count()
-        logger.info(f"CUDA available: {n} GPU(s)")
-        return torch.device("cuda")
+        logger.info(f"CUDA: {n} GPU(s), using cuda:{local_rank}")
+        return torch.device(f"cuda:{local_rank}")
     logger.warning("No CUDA found, falling back to CPU.")
     return torch.device("cpu")
 
@@ -742,7 +756,7 @@ def run_epoch(model, loader, device, optimizer=None, epoch=0):
     training = optimizer is not None
     model.train() if training else model.eval()
 
-    raw_model = model
+    raw_model = model.module if hasattr(model, "module") else model
     if training and epoch < cfg.BACKBONE.TRAIN_EPOCH:
         for m in raw_model.backbone.modules():
             if isinstance(m, nn.BatchNorm2d):
@@ -811,11 +825,13 @@ def main():
                         ))
     args = parser.parse_args()
 
-    random.seed(args.seed)
-    np.random.seed(args.seed)
-    torch.manual_seed(args.seed)
+    rank, local_rank, world_size, is_main = init_distributed()
+    # Per-rank seed so each DDP process samples different pairs
+    random.seed(args.seed + rank)
+    np.random.seed(args.seed + rank)
+    torch.manual_seed(args.seed + rank)
     if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(args.seed)
+        torch.cuda.manual_seed_all(args.seed + rank)
         torch.backends.cudnn.benchmark = True
 
     cfg.merge_from_file(args.cfg)
@@ -835,11 +851,14 @@ def main():
         logger.info("      Early stopping + checkpoint rotation disabled.")
         logger.info("=" * 60)
 
-    device = get_device()
+    device = get_device(local_rank)
 
-    os.makedirs(cfg.TRAIN.LOG_DIR,      exist_ok=True)
-    os.makedirs(cfg.TRAIN.SNAPSHOT_DIR, exist_ok=True)
-    tb_writer = SummaryWriter(cfg.TRAIN.LOG_DIR)
+    if is_main:
+        os.makedirs(cfg.TRAIN.LOG_DIR,      exist_ok=True)
+        os.makedirs(cfg.TRAIN.SNAPSHOT_DIR, exist_ok=True)
+    if world_size > 1:
+        dist.barrier()   # wait for rank-0 to create dirs
+    tb_writer = SummaryWriter(cfg.TRAIN.LOG_DIR) if is_main else None
 
     # ── model ─────────────────────────────────────────────────────────────────
     model = ModelBuilder()
@@ -854,10 +873,17 @@ def main():
         p.requires_grad = False
 
     model = model.to(device)
-    n_gpus = torch.cuda.device_count()
-    logger.info(f"Found {n_gpus} GPU(s) — single-GPU training with gradient accumulation (accum_steps={cfg.TRAIN.GRAD_ACCUM_STEPS})")
+    if world_size > 1:
+        model = DDP(model, device_ids=[local_rank], output_device=local_rank,
+                    find_unused_parameters=False)
+        if is_main:
+            logger.info(f"DDP enabled: {world_size} GPUs (local_rank={local_rank})")
+    else:
+        n_gpus = torch.cuda.device_count()
+        logger.info(f"Found {n_gpus} GPU(s) â single-GPU training "
+                    f"(accum_steps={cfg.TRAIN.GRAD_ACCUM_STEPS})")
 
-    raw_model = model
+    raw_model = model.module if isinstance(model, DDP) else model
 
     # ── datasets ──────────────────────────────────────────────────────────────
     logger.info("=" * 60)
@@ -929,7 +955,7 @@ def main():
             w("ANTIUAV300",  2.5), w("BIRDSAI",  1.5),
             w("HITUAV",     1.0),
         ],
-        total_len=cfg.DATASET.VIDEOS_PER_EPOCH,
+        total_len=cfg.DATASET.VIDEOS_PER_EPOCH // max(world_size, 1),
     )
 
     # Validation — AntiUAV410 + MSRS + VTMOT + new val splits
@@ -1078,20 +1104,21 @@ def main():
             tb_writer.add_scalar("early_stopping/counter", early_stopping.counter, epoch + 1)
 
         # Log epoch summary — include early-stopping counter so it's always visible
-        logger.info(
-            f"Epoch [{epoch+1:>3}/{cfg.TRAIN.EPOCH}]  "
-            f"train={train_loss:.4f}  val={val_loss:.4f}  "
-            f"lr={lr_log:.2e}  "
-            f"best_val={best_val_loss:.4f}  "
-            f"ES={early_stopping.counter}/{early_stopping.patience}"
-        )
-        tb_writer.add_scalars("loss", {"train": train_loss, "val": val_loss}, epoch + 1)
-        tb_writer.add_scalar("lr/current",  lr_log,  epoch + 1)
-        tb_writer.add_scalar("lr/sgdr",     lr,      epoch + 1)
+        if is_main:
+            logger.info(
+                f"Epoch [{epoch+1:>3}/{cfg.TRAIN.EPOCH}]  "
+                f"train={train_loss:.4f}  val={val_loss:.4f}  "
+                f"lr={lr_log:.2e}  "
+                f"best_val={best_val_loss:.4f}  "
+                f"ES={early_stopping.counter}/{early_stopping.patience}"
+            )
+            tb_writer.add_scalars("loss", {"train": train_loss, "val": val_loss}, epoch + 1)
+            tb_writer.add_scalar("lr/current",  lr_log,  epoch + 1)
+            tb_writer.add_scalar("lr/sgdr",     lr,      epoch + 1)
 
         # save periodic checkpoint every 10 epochs — keep only the last 2
         # (skipped entirely in smoke-test mode)
-        if not args.smoke_test and (epoch + 1) % 10 == 0:
+        if is_main and not args.smoke_test and (epoch + 1) % 10 == 0:
             ckpt_path = os.path.join(cfg.TRAIN.SNAPSHOT_DIR,
                                      f"checkpoint_e{epoch+1}.pth")
             torch.save({"epoch": epoch+1,
@@ -1122,7 +1149,7 @@ def main():
                 logger.info(f"  ✔ Keeping last 2 checkpoints: {remaining}")
 
         # save best model
-        if val_loss < best_val_loss:
+        if is_main and val_loss < best_val_loss:
             best_val_loss = val_loss
             torch.save({"epoch": epoch+1,
                         "state_dict":        raw_model.state_dict(),
@@ -1164,3 +1191,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+    if dist.is_available() and dist.is_initialized():
+        dist.destroy_process_group()

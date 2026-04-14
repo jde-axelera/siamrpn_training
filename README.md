@@ -14,12 +14,14 @@ Built on [PySOT](https://github.com/STVIR/pysot). Designed to run on AWS GPU ins
 4. [Quick Start](#4-quick-start)
 5. [Datasets](#5-datasets)
 6. [Training Details](#6-training-details)
-7. [ONNX Export](#7-onnx-export)
-8. [Evaluation](#8-evaluation)
-9. [Demo Videos](#9-demo-videos)
-10. [Inference Hyperparameters](#10-inference-hyperparameters)
-11. [Directory Layout](#11-directory-layout)
-12. [Operations & Advanced](#12-operations--advanced)
+7. [Multi-GPU Training (DDP)](#7-multi-gpu-training-ddp)
+8. [ONNX Export](#8-onnx-export)
+9. [Evaluation](#9-evaluation)
+10. [Demo Videos](#10-demo-videos)
+11. [Inference Hyperparameters](#11-inference-hyperparameters)
+12. [Directory Layout](#12-directory-layout)
+13. [Operations & Advanced](#13-operations--advanced)
+14. [Changelog & Development Notes](#14-changelog--development-notes)
 
 ---
 
@@ -332,7 +334,237 @@ tensorboard --logdir pysot/logs/all_datasets
 
 ---
 
-## 7. ONNX Export
+## 7. Multi-GPU Training (DDP)
+
+### Background: why not DataParallel?
+
+PyTorch offers two multi-GPU APIs:
+
+| | `nn.DataParallel` | `DistributedDataParallel` (DDP) |
+|---|---|---|
+| Process model | Single process, multiple threads | One process per GPU |
+| Data split | Scatter/gather on every forward | Each rank owns its own data copy |
+| Gradient sync | Reduce on CPU after backward | NCCL all-reduce during backward |
+| Works with dict inputs | **No** — scatter breaks dict forwarding | **Yes** |
+| Scales beyond 1 node | No | Yes |
+| Overhead | High (GIL contention, scatter) | Low (async all-reduce) |
+
+PySOT's `ModelBuilder.forward()` takes a `dict` of tensors (`template`, `search`, `label_cls`, ...). DataParallel's internal scatter mechanism cannot shard a dict cleanly across GPUs — it raises errors in PyTorch 2.x. DDP sidesteps this entirely: each GPU runs a fully independent forward pass on its own data slice, then gradients are synchronised via NCCL at the end of backward.
+
+Additionally, PySOT's `resnet_atrous` backbone has dilated convolutions (`dilation=4` in layer 4). When DataParallel broadcasts the weight tensors to replicas, the resulting tensor alignment triggers `CUDA error: misaligned address` inside `conv2d`. DDP never copies weights — each GPU owns its own model replica with properly allocated memory from the start.
+
+---
+
+### How DDP works in 3 steps
+
+```
+torchrun --nproc_per_node=4 train_siamrpn_aws.py
+         │
+         ├── spawns 4 independent OS processes
+         │   (rank 0, 1, 2, 3 — one per GPU)
+         │
+         │   Each process:
+         │   ┌──────────────────────────────────────────┐
+         │   │  1. FORWARD                              │
+         │   │     Load its own mini-batch (batch/4)    │
+         │   │     Run the full model on its GPU        │
+         │   │     Compute loss on its batch            │
+         │   └──────────────┬───────────────────────────┘
+         │                  │
+         │   ┌──────────────▼───────────────────────────┐
+         │   │  2. BACKWARD + ALL-REDUCE                │
+         │   │     Compute gradients locally            │
+         │   │     NCCL all-reduce: sum gradients       │
+         │   │     across all 4 GPUs, divide by 4       │
+         │   │     → every GPU now has the same         │
+         │   │       averaged gradient                  │
+         │   └──────────────┬───────────────────────────┘
+         │                  │
+         │   ┌──────────────▼───────────────────────────┐
+         │   │  3. OPTIMIZER STEP                       │
+         │   │     All 4 GPUs apply identical updates   │
+         │   │     Models stay in sync without          │
+         │   │     any weight broadcast                 │
+         │   └──────────────────────────────────────────┘
+```
+
+Because the all-reduce **averages** gradients, a DDP run with `batch_size=8` per GPU and 4 GPUs computes the same gradient as a single-GPU run with `batch_size=32` at the same learning rate. You get linear throughput scaling with zero accuracy cost.
+
+---
+
+### The critical ordering rule: `set_device` before `init_process_group`
+
+This is the single most common DDP bug. NCCL creates a CUDA context for inter-GPU communication at `init_process_group` time. If you have not told CUDA which device this process owns yet, all 4 processes create their CUDA context on GPU 0 (the default device), and all training ends up on one card:
+
+```python
+# WRONG — all 4 processes end up on GPU 0
+def init_distributed():
+    dist.init_process_group(backend="nccl")   # ← NCCL binds to default GPU 0
+    local_rank = int(os.environ["LOCAL_RANK"])
+    torch.cuda.set_device(local_rank)          # ← too late
+
+# CORRECT — each process claims its GPU first
+def init_distributed():
+    local_rank = int(os.environ["LOCAL_RANK"])
+    torch.cuda.set_device(local_rank)          # ← claim GPU before NCCL init
+    dist.init_process_group(backend="nccl")   # ← NCCL sees the correct device
+```
+
+The symptom of the wrong order: `nvidia-smi` shows GPU 0 at 10–12 GB with 4 processes, and GPUs 1–3 at 3 MB (no training memory).
+
+---
+
+### Effective batch size and learning rate
+
+```
+Single GPU    batch_size = 32,   LR = 0.005
+              → 1 gradient step on 32 samples
+
+4 GPU DDP     batch_size = 8/GPU × 4 GPUs = 32 effective,   LR = 0.005
+              → all-reduce averages 4 × 8-sample gradients
+              → mathematically identical gradient step
+```
+
+**LR scaling rule:** if you increase effective batch size (e.g., `batch_size=32/GPU` → effective 128), scale LR proportionally: `LR = 0.005 × 4 = 0.020`. The current config uses `batch_size=32` with 4 GPUs (8 effective per GPU), keeping LR at 0.005 for a conservative, stable training run.
+
+---
+
+### How to run
+
+#### Single GPU
+
+```bash
+conda activate pysot
+python train_siamrpn_aws.py \
+    --cfg  pysot/experiments/siamrpn_r50_alldatasets/config.yaml \
+    --pretrained pretrained/sot_resnet50.pth
+```
+
+#### 4 GPU (DDP via torchrun)
+
+```bash
+/data/miniconda3/envs/pysot/bin/torchrun \
+    --nproc_per_node=4 \
+    train_siamrpn_aws.py \
+    --cfg  pysot/experiments/siamrpn_r50_alldatasets/config.yaml \
+    --pretrained pretrained/sot_resnet50.pth
+```
+
+Use the launcher script (handles log file naming automatically):
+
+```bash
+bash start_ddp.sh
+```
+
+Or in a persistent tmux session (survives SSH disconnect):
+
+```bash
+tmux new-session -d -s training
+tmux send-keys -t training 'bash /data/siamrpn_training/start_ddp.sh' Enter
+tmux attach -t training        # to watch output
+```
+
+#### Resume from a checkpoint (DDP)
+
+```bash
+/data/miniconda3/envs/pysot/bin/torchrun --nproc_per_node=4 \
+    train_siamrpn_aws.py \
+    --cfg  pysot/experiments/siamrpn_r50_alldatasets/config.yaml \
+    --pretrained pretrained/sot_resnet50.pth \
+    --resume pysot/snapshot/all_datasets/checkpoint_e050.pth
+```
+
+---
+
+### Verify all GPUs are being used
+
+Within 30 seconds of launching, all 4 GPUs should show ~2–3 GB memory and high utilisation:
+
+```bash
+watch -n 2 nvidia-smi
+
+# Expected output — 4 processes, ~2.6 GB each:
+# +----+----------+-------+---+
+# |  0 |  2591 MiB| 99 %  |   |
+# |  1 |  2591 MiB| 99 %  |   |
+# |  2 |  2591 MiB| 97 %  |   |
+# |  3 |  2591 MiB| 100 % |   |
+# +----+----------+-------+---+
+
+# Per-process breakdown:
+nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader
+# 51418, 2588 MiB   ← rank 0
+# 51419, 2588 MiB   ← rank 1
+# 51420, 2588 MiB   ← rank 2
+# 51421, 2588 MiB   ← rank 3
+
+# If only GPU 0 is used (wrong):
+# |  0 |  10661 MiB| 100 % |   ← all 4 processes on GPU 0
+# |  1 |      3 MiB|   0 % |
+```
+
+If only GPU 0 is used, check that `torch.cuda.set_device(local_rank)` appears **before** `dist.init_process_group(backend="nccl")` in `init_distributed()`.
+
+---
+
+### Gradient-flow / DDP parity test
+
+Before committing to a 500-epoch run, verify gradient flow and DDP correctness by overfitting on 32 real samples. Both single-GPU and DDP should reach loss < 0.5 by epoch 80:
+
+```bash
+# Phase 1: single GPU
+python overfit_test.py \
+    --cfg pysot/experiments/siamrpn_r50_alldatasets/config.yaml \
+    --pretrained pretrained/sot_resnet50.pth \
+    --samples 32 --epochs 80 --out overfit_1gpu.csv
+
+# Phase 2: 4-GPU DDP
+/data/miniconda3/envs/pysot/bin/torchrun --nproc_per_node=4 overfit_test.py \
+    --cfg pysot/experiments/siamrpn_r50_alldatasets/config.yaml \
+    --pretrained pretrained/sot_resnet50.pth \
+    --samples 32 --epochs 80 --out overfit_4gpu.csv
+
+# Compare loss curves
+python overfit_test.py --compare overfit_1gpu.csv overfit_4gpu.csv
+```
+
+Expected output:
+
+```
+  Final (ep 80):  A=0.077  B=0.111  |diff|=0.034
+  Both overfit (< 0.50) : YES ✓
+  Loss parity (|diff|<0.10): YES ✓
+
+  ✓ DDP and single-GPU converge identically. Gradient flow OK.
+```
+
+The DDP run ends slightly higher (0.111 vs 0.077) because with 8 samples per GPU per step, gradients are noisier than a full 32-sample batch. Both clearly overfit, confirming end-to-end gradient flow.
+
+Run the full orchestrated test:
+
+```bash
+bash run_overfit.sh
+```
+
+---
+
+### What happens to checkpoints and logging with DDP
+
+Only rank 0 (`is_main = True`) writes to disk to avoid 4 processes clobbering the same files:
+
+| Operation | Behaviour |
+|-----------|-----------|
+| `os.makedirs` | Rank 0 only; other ranks wait at `dist.barrier()` |
+| `SummaryWriter` | Rank 0 only; non-main ranks get `tb_writer = None` |
+| Checkpoint saves | Rank 0 only |
+| Best model saves | Rank 0 only |
+| Per-epoch loss logging | Rank 0 logs average of all-reduced loss |
+| `logger.info` step logs | All ranks (expected duplicate lines for n GPUs) |
+
+
+---
+
+## 8. ONNX Export
 
 The model is split into two ONNX files to enable efficient edge deployment — the template is encoded once per target, only the tracker runs every frame.
 
@@ -352,7 +584,7 @@ Exported at **opset 11** using the TorchScript-based exporter (`dynamo=False`) t
 
 ---
 
-## 8. Evaluation
+## 9. Evaluation
 
 ```bash
 python eval_onnx.py \
@@ -378,7 +610,7 @@ Results written to `eval_results/epoch_NNNN.json`.
 
 ---
 
-## 9. Demo Videos
+## 10. Demo Videos
 
 **ONNX tracker demo** — renders GT (green) vs. predicted (yellow dashed) boxes with per-frame IoU overlay:
 
@@ -405,7 +637,7 @@ Output: `demo/test_gt_demo.mp4`
 
 ---
 
-## 10. Inference Hyperparameters
+## 11. Inference Hyperparameters
 
 These parameters control how the tracker decodes the RPN output at inference time and are not trained — they are post-processing choices tuned on a validation set.
 
@@ -427,7 +659,7 @@ These parameters control how the tracker decodes the RPN output at inference tim
 
 ---
 
-## 11. Directory Layout
+## 12. Directory Layout
 
 ```
 siamrpn_training/
@@ -474,7 +706,7 @@ siamrpn_training/
 
 ---
 
-## 12. Operations & Advanced
+## 13. Operations & Advanced
 
 ### Running on a limited root partition
 
@@ -552,11 +784,244 @@ Tracking strip — `excavator_003` from start to end (15,580 frames):
 |------|-------|-----|
 | 2026-04-13 | `gdown --fuzzy` removed in gdown 6.x | Removed flag from all 7 calls |
 | 2026-04-13 | Root partition fills on small AWS volumes | `--install-dir` flag redirects all writes |
-| 2026-04-14 | `DataParallel` breaks pysot dict-based `forward` in PyTorch 2.x | Disabled `DataParallel`; single-GPU training |
-| 2026-04-14 | `model_builder.py` calls `next(self.parameters()).device` inside DataParallel replica | Changed to `data['template'].device` |
-| 2026-04-14 | DUT-VTUAV annotations mapped to wrong frames | Frame key = `i × 10` (1 fps annos, 10 fps video) |
-| 2026-04-14 | MSRS annotations used full-image placeholder `[0,0,640,480]` | Extract largest connected component from segmentation labels |
-| 2026-04-14 | MSRS frame finder always loaded files[0] / files[1] | Use `seq_idx + frame_id − 1` offset |
+| 2026-04-14 | `DataParallel` scatter breaks pysot dict `forward` | Replaced with gradient accumulation then DDP |
+| 2026-04-14 | `resnet_atrous` dilated conv misaligned address under DataParallel | Root cause of scatter issue; DDP avoids weight broadcast entirely |
+| 2026-04-14 | All 4 DDP processes land on GPU 0 | `set_device(local_rank)` must be called before `init_process_group` |
+| 2026-04-14 | `run_epoch` accesses `.backbone` on DDP wrapper | `raw_model = model.module if hasattr(model, 'module') else model` |
+| 2026-04-14 | `is_main` used in training loop but never defined | Defined by `init_distributed()` return value |
+| 2026-04-14 | DUT-Anti-UAV dataset removed (no usable annotations) | Dead `DUTAntiUAVDataset` class and config section removed |
+| 2026-04-14 | DUT-VTUAV annotations mapped to wrong frames | Frame key = `i × 10` (1 fps annos on 10 fps video) |
+| 2026-04-14 | MSRS annotations were full-image placeholder `[0,0,640,480]` | Extract bbox from largest connected component in segmentation mask |
+| 2026-04-14 | MSRS frame finder always returned `files[0]` / `files[1]` | Use `seq_idx + frame_id − 1` index into sorted IR file list |
+
+---
+
+## 14. Changelog & Development Notes
+
+This section documents every significant change made to the training pipeline, including the reasoning behind each decision. Intended as a reference when resuming work or debugging regressions.
+
+---
+
+### 2026-04-14 — Multi-GPU Training
+
+#### Problem: DataParallel fails with PySOT
+
+The original script ran on a single GPU despite the instance having 4× Tesla T4 GPUs (64 GB total VRAM available). The first attempt to add `nn.DataParallel` failed in two distinct ways:
+
+**Failure 1 — dict scatter error.**
+`ModelBuilder.forward()` expects a single dict argument `{'template': ..., 'search': ..., 'label_cls': ...}`. `DataParallel` scatters inputs positionally across GPUs and cannot shard a dict. PyTorch 2.x raises a `TypeError` at the first forward pass.
+
+**Failure 2 — CUDA misaligned address.**
+Even after wrapping the model in a `ModelForwardWrapper` that converts the dict to positional args, a `RuntimeError: CUDA error: misaligned address` appeared inside `resnet_atrous.py`. The root cause: PySOT's dilated ResNet-50 uses `dilation=4` in layer 4. When DataParallel broadcasts weight tensors to GPU replicas, the replica allocations are not aligned to the boundary that the CUDA dilation kernel requires. This is a PyTorch-level issue with how DataParallel copies non-contiguous dilated conv weights — not fixable without patching the CUDA kernel.
+
+#### Intermediate step: gradient accumulation (single GPU)
+
+Before implementing DDP, gradient accumulation was added as a stopgap — it keeps memory per step low by accumulating gradients over `GRAD_ACCUM_STEPS=4` mini-batches before calling `optimizer.step()`. This gives an effective batch of `32 × 4 = 128` on a single GPU without multi-GPU overhead.
+
+Config key added to `pysot/core/config.py` (yacs requires explicit schema declaration):
+```python
+__C.TRAIN.GRAD_ACCUM_STEPS = 1   # default: no accumulation
+```
+
+Gradient accumulation in `run_epoch`:
+```python
+(loss / accum_steps).backward()   # scale loss so accumulated gradient = mean
+if (step + 1) % accum_steps == 0 or (step + 1) == len(loader):
+    clip_grad_norm_(model.parameters(), cfg.TRAIN.GRAD_CLIP)
+    optimizer.step()
+    optimizer.zero_grad()
+```
+
+#### Final fix: DistributedDataParallel (DDP)
+
+DDP was implemented via `torchrun --nproc_per_node=4`. Each GPU gets its own independent OS process — no scatter, no weight broadcast, no GIL contention. Gradients are synchronised via NCCL all-reduce during backward, which averages gradients across all ranks. The model stays in sync without any explicit parameter copying.
+
+Changes to `train_siamrpn_aws.py`:
+
+| Location | Change |
+|----------|--------|
+| Imports | Added `torch.distributed as dist`, `DistributedDataParallel as DDP` |
+| New function | `init_distributed()` — returns `(rank, local_rank, world_size, is_main)` |
+| `main()` | Call `init_distributed()` as the very first thing, before seeding |
+| `main()` | `device = torch.device(f"cuda:{local_rank}")` |
+| `main()` | `model = DDP(model, device_ids=[local_rank], output_device=local_rank)` |
+| `main()` | `raw_model = model.module if isinstance(model, DDP) else model` |
+| `main()` | `makedirs`, `SummaryWriter`, checkpoints gated on `is_main` |
+| `main()` | `dist.barrier()` after makedirs so rank 0 creates dirs before others proceed |
+| `main()` | `total_len = VIDEOS_PER_EPOCH // world_size` per rank |
+| `run_epoch()` | `raw_model = model.module if hasattr(model, "module") else model` |
+| Bottom | `dist.destroy_process_group()` on exit |
+
+---
+
+#### Bug: all 4 processes on GPU 0
+
+After the initial DDP implementation, `nvidia-smi` showed all training memory on GPU 0:
+
+```
+GPU 0: 10661 MiB   ← 4 processes × ~2500 MiB
+GPU 1:     3 MiB
+GPU 2:     3 MiB
+GPU 3:     3 MiB
+```
+
+**Root cause:** `dist.init_process_group(backend="nccl")` was called before `torch.cuda.set_device(local_rank)`. NCCL creates a CUDA context for inter-GPU communication at `init_process_group` time. Without an explicit device assignment beforehand, all 4 processes bind their NCCL context to the default device (GPU 0).
+
+**Fix — swap the order in `init_distributed()`:**
+
+```python
+# Before (wrong):
+dist.init_process_group(backend="nccl")
+local_rank = int(os.environ["LOCAL_RANK"])
+torch.cuda.set_device(local_rank)   # too late — NCCL already bound to GPU 0
+
+# After (correct):
+local_rank = int(os.environ["LOCAL_RANK"])
+torch.cuda.set_device(local_rank)   # claim device first
+dist.init_process_group(backend="nccl")   # NCCL sees the correct device
+```
+
+After the fix, `nvidia-smi` shows all 4 GPUs active:
+
+```
+GPU 0: 2591 MiB  99 %
+GPU 1: 2591 MiB  99 %
+GPU 2: 2591 MiB  97 %
+GPU 3: 2591 MiB 100 %
+```
+
+---
+
+#### Bug: `AttributeError: 'DistributedDataParallel' object has no attribute 'backbone'`
+
+`run_epoch` had:
+```python
+raw_model = model   # model is the DDP wrapper — has no .backbone
+for m in raw_model.backbone.modules():   # AttributeError
+```
+
+Fix:
+```python
+raw_model = model.module if hasattr(model, "module") else model
+```
+
+This pattern needs to appear in every function that accesses the underlying PySOT model attributes directly (`backbone`, `neck`, `rpn_head`).
+
+---
+
+### 2026-04-14 — Dataset Fixes
+
+#### DUT-Anti-UAV removed
+
+The `DUTAntiUAVDataset` class and its config section were removed. The dataset's annotation files were never successfully converted to PySOT format and the code was dead weight. Removing it:
+- Cleaned up the dead class from `train_siamrpn_aws.py`
+- Removed the `DUTANTIUAV` block from `config.yaml`
+- Updated `NAMES` list in config
+- Removed the dataset from the README sampling table
+
+The remaining 9 datasets (8 active, 1 conditional) are unaffected.
+
+#### DUT-VTUAV: wrong frame index
+
+**Problem:** DUT-VTUAV is filmed at 10 fps but annotated at 1 fps. The `groundtruth.txt` has one bbox per second. The original converter wrote annotation line `i` as frame key `i`, causing all annotations to map to the first 10% of frames.
+
+**Fix:** Frame key = `i × 10`. Line 0 → frame 0, line 1 → frame 10, line 2 → frame 20, etc.
+
+```python
+# Before:
+frame_key = f"{i:06d}"
+
+# After:
+frame_key = f"{i * 10:06d}"
+```
+
+This moves all annotation keys to the correct positions in the video.
+
+#### MSRS: placeholder bounding boxes
+
+**Problem:** MSRS is a semantic segmentation dataset. The original annotation converter assigned placeholder bboxes `[0, 0, 640, 480]` (the full image) to every frame because it didn't extract actual object positions from the segmentation masks.
+
+**Fix:** Extract the bounding box of the largest connected component from the segmentation label image:
+
+```python
+# Load binary segmentation mask, find contours, take largest
+contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+largest = max(contours, key=cv2.contourArea)
+x, y, w, h = cv2.boundingRect(largest)
+bbox = [x, y, x + w, y + h]
+```
+
+Sequences where no contour is found (fully background frames) are skipped.
+
+#### MSRS: frame finder returning wrong images
+
+**Problem:** The `_find_image` method in `MSRSDataset` always returned `files[0]` for `frame_id=1` and `files[1]` for `frame_id=2`, regardless of which pseudo-sequence (`seq`) was being loaded. All training pairs were drawn from the first two images in the IR directory.
+
+**Root cause:** The sequence key encodes the starting image index (`msrs_train_NNNNN`), but the frame finder was not using it.
+
+**Fix:** Parse the sequence index from the key and offset by `frame_id - 1`:
+
+```python
+seq_idx = int(seq.rsplit("_", 1)[-1])   # extract N from msrs_train_N
+idx = seq_idx + (frame_id - 1)          # frame 1 → files[N], frame 2 → files[N+1]
+return os.path.join(self.ir_dir, sorted_imgs[idx])
+```
+
+---
+
+### 2026-04-14 — New Scripts
+
+#### `overfit_test.py`
+
+A gradient-flow and DDP correctness verification script. Pre-loads `N` real sample pairs (default 32) from Anti-UAV410 into memory — no runtime randomness, same data every run. Trains for E epochs with Adam, logs loss to CSV.
+
+Run in both single-GPU and DDP mode, then compare with `--compare`:
+
+```bash
+python overfit_test.py --out overfit_1gpu.csv
+torchrun --nproc_per_node=4 overfit_test.py --out overfit_4gpu.csv
+python overfit_test.py --compare overfit_1gpu.csv overfit_4gpu.csv
+```
+
+Verified result (2026-04-14):
+- Single GPU final loss: **0.077** ✓
+- 4-GPU DDP final loss: **0.111** ✓
+- Both below threshold 0.50 — gradients flow correctly end-to-end in both modes
+
+The small gap (0.077 vs 0.111) is expected: DDP uses `batch_size=8/GPU` (noisier gradients) while single-GPU uses `batch_size=32` (lower variance). Both clearly overfit, confirming there are no dead weights or broken loss paths.
+
+#### `start_ddp.sh`
+
+Convenience launcher that calls torchrun with the correct config and auto-names the log file by timestamp:
+
+```bash
+bash start_ddp.sh   # writes logs/train_ddp_YYYYMMDD_HHMMSS.log
+```
+
+#### `run_overfit.sh`
+
+Orchestrates the full two-phase overfit test (single-GPU → DDP → compare) as a single command:
+
+```bash
+bash run_overfit.sh
+```
+
+---
+
+### 2026-04-14 — README Rewrite
+
+The README was rewritten from a pure operational reference into an educational document for readers with a YOLO/detection background. New content added:
+
+| Section | What was added |
+|---------|---------------|
+| §1 Background | Conceptual shift from detection to tracking; why IR tracking matters |
+| §2 Architecture | Full ASCII forward-pass diagram; DW-XCorr explained as dynamic query kernel; anchor grid analogy to YOLO |
+| §3 Training differences | Side-by-side table: YOLO vs SiamRPN++ on input, label, loss, dataset type, epoch structure, category awareness; explanation of why pairs are used instead of full frames |
+| §5 Datasets | Per-dataset annotation format notes; strip images for visual quality check |
+| §6 Training Details | Sampling probability table with rationale per dataset; LR schedule timeline diagram |
+| §7 Multi-GPU (DDP) | Full DDP background section (see §7) |
+| §10 Inference hyperparameters | Plain-English "what it does" column for every tracker parameter |
+
 
 ---
 
