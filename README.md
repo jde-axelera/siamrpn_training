@@ -107,57 +107,73 @@ reportlab   — PDF report generation
 
 ---
 
-## Training
+---
 
-Run directly (after the pipeline has set up the environment and data):
+## Training Methodology
 
-```bash
-conda activate pysot
+### Siamese Pair Sampling
 
-python train_siamrpn_aws.py \
-    --cfg pysot/experiments/siamrpn_r50_alldatasets/config.yaml \
-    --pretrained pretrained/sot_resnet50.pth
+SiamRPN++ is trained on pairs of image crops rather than full frames. Each training sample consists of:
+
+- **Template** `z` — a 127×127 px crop centred on the target at frame `t`, providing the reference appearance.
+- **Search region** `x` — a 255×255 px crop centred near the target at frame `t + δ` (a few frames later), within which the model must localise the object.
+
+The backbone encodes both crops, a depth-wise cross-correlation (DW-XCorr) is applied between the template features and the search features, and the RPN head outputs a classification map and a localisation map. The loss is a combination of cross-entropy (foreground/background) and smooth-L1 (bounding-box regression) over all anchor positions.
+
+---
+
+### Epoch Length and Dataset Sampling
+
+Training does **not** loop once through every sequence per epoch. Instead, each epoch draws a fixed budget of **10,000 (template, search) pairs** sampled stochastically from the combined dataset:
+
+1. A dataset is chosen according to its `sample_prob` (see table below).
+2. A sequence is sampled uniformly from that dataset.
+3. A valid frame pair `(t, t + δ)` is sampled from that sequence.
+4. Template and search crops are extracted and augmented.
+
+This is repeated 10,000 times. At batch size 32 this yields **≈ 312 gradient steps per epoch**, giving a predictable and tunable training cadence independent of total dataset size.
+
+#### Dataset sampling probabilities
+
+Probabilities are **not proportional to dataset size** — smaller, task-critical datasets are upweighted so the model receives balanced exposure across object categories and IR conditions:
+
+| Dataset | Sequences | `sample_prob` | Role |
+|---------|-----------|--------------|------|
+| AntiUAV410 | 200 | 0.316 | Primary IR UAV target — highest weight |
+| DUT-VTUAV | 225 | 0.263 | Large-scale RGB+Thermal UAV scenes |
+| DUT-Anti-UAV | 20 | 0.211 | IR drone close-up sequences |
+| MSRS | 541 | 0.105 | Paired IR/visible road scenes |
+| MassMIND | 1,801 | 0.105 | Maritime LWIR — largest dataset, downweighted |
+
+Datasets missing their annotation JSON (VT-MOT, MVSS, AntiUAV300, BIRDSAI, HIT-UAV) are automatically excluded and the remaining probabilities are renormalised to sum to 1.
+
+---
+
+### Learning Rate Schedule
+
+```
+Epochs 0 – 5    Linear warm-up from ~0 → base_lr (0.005)
+Epochs 5 – end  SGDR cosine annealing  T₀ = 50, T_mult = 2
+                  → restarts at epochs 50, 150, 350, …
+Plateau rescue  ReduceLROnPlateau  ×0.3 after 15 stagnant epochs, floor 1e-7
 ```
 
-### Key hyperparameters
+The backbone is frozen for the first 10 epochs (`BACKBONE_TRAIN_EPOCH = 10`); only the neck and RPN head are trained. After epoch 10 the backbone is unfrozen and trained at a reduced learning-rate scale (`BACKBONE.LAYERS_LR`).
 
-| Parameter | Value | Notes |
-|-----------|-------|-------|
-| Epochs | 500 | |
-| Batch size | 32 | |
-| Data workers | 8 | |
-| Base LR | 0.005 | |
-| Backbone freeze | first 10 epochs | `BACKBONE_TRAIN_EPOCH` |
-| Videos per epoch | 10,000 | |
-| Warmup | 5 epochs | linear from ~0 to base LR |
-| LR schedule | SGDR | restarts at epochs 50 / 150 / 350 |
-| LR rescue | ReduceLROnPlateau | ×0.3 after 15 stagnant epochs |
-| Early stopping | patience 50, Δ=1e-4 | relative validation loss |
-| Checkpoints | every 10 epochs | rolling window of 2 + best model |
-| Gradient clip | norm=10 | |
+---
 
-### Learning rate schedule
+### Early Stopping and Checkpointing
 
-```
-Epochs 0–5:     Linear warmup → base_lr
-Epochs 5–end:   SGDR cosine annealing  (T₀=50, T_mult=2)
-                  restart at 50 → 150 → 350 → ...
-If plateau:     ReduceLROnPlateau (×0.3, floor 1e-7)
-```
+| Setting | Value |
+|---------|-------|
+| Patience | 50 epochs |
+| Min improvement Δ | 1 × 10⁻⁴ (relative val loss) |
+| Checkpoint frequency | Every 10 epochs |
+| Checkpoint retention | Rolling window of 2 + best model |
+| Gradient clip | Norm = 10 |
 
-### Monitor training (separate terminal)
+The best checkpoint is saved to `pysot/snapshot/all_datasets/best_model.pth` whenever validation loss improves.
 
-```bash
-./monitor_training.sh &
-```
-
-Polls logs every 30 seconds. Every 25 epochs: exports ONNX → runs evaluation → prints a colour-coded IoU/AUC trend table.
-
-### TensorBoard
-
-```bash
-tensorboard --logdir pysot/logs/all_datasets
-```
 
 ---
 
