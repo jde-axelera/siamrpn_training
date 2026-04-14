@@ -288,12 +288,16 @@ class MSRSDataset(IRTrackingDatasetBase):
             os.path.join(root, "ir")) else root
 
     def _find_image(self, seq, frame_id):
-        # MSRS stores images as <name>.png in ir/ folder; seq encodes the pair index
-        # Parse actual filenames from sorted listing (stored during annotation conversion)
+        # seq = msrs_<split>_NNNNN — encode the pair start index N
+        # frame_id 1 -> files[N], frame_id 2 -> files[N+1]
         imgs = sorted(f for f in os.listdir(self.ir_dir)
                       if f.lower().endswith((".png", ".jpg", ".bmp")))
-        # frame_id is 1-based index into sorted list
-        idx = min(frame_id - 1, len(imgs) - 1)
+        try:
+            seq_idx = int(seq.rsplit("_", 1)[-1])
+        except (ValueError, IndexError):
+            seq_idx = 0
+        idx = seq_idx + (frame_id - 1)
+        idx = min(idx, len(imgs) - 1)
         if idx < 0 or not imgs:
             return None
         return os.path.join(self.ir_dir, imgs[idx])
