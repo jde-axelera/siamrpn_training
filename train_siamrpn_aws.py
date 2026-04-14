@@ -731,86 +731,55 @@ def build_optimizer(model):
 
 
 
-# ── DataParallel-compatible wrapper ───────────────────────────────────────────
-class ModelForwardWrapper(nn.Module):
-    """Converts pysot ModelBuilder (dict forward) to individual-tensor forward.
-
-    nn.DataParallel scatter fails in PyTorch 2.x when given a dict containing
-    mixed dtypes (float32 template/search + int64 label_cls).  Passing each
-    tensor as a positional argument — which DataParallel handles natively —
-    and reconstructing the dict inside the wrapper avoids this entirely.
-    """
-    def __init__(self, model):
-        super().__init__()
-        self.model = model
-
-    def forward(self, template, search, label_cls, label_loc,
-                label_loc_weight, bbox):
-        # .contiguous() is required: DataParallel scatter produces non-contiguous
-        # tensor slices which cause misaligned address errors in pysot's dilated
-        # convolutions (resnet_atrous conv2).
-        return self.model({
-            "template":         template.contiguous(),
-            "search":           search.contiguous(),
-            "label_cls":        label_cls.contiguous(),
-            "label_loc":        label_loc.contiguous(),
-            "label_loc_weight": label_loc_weight.contiguous(),
-            "bbox":             bbox.contiguous(),
-        })
-
-
 # ── one epoch forward ─────────────────────────────────────────────────────────
 def run_epoch(model, loader, device, optimizer=None, epoch=0):
     training = optimizer is not None
     model.train() if training else model.eval()
 
-    # Unwrap through DataParallel → ModelForwardWrapper → actual ModelBuilder
-    raw_model = (model.module if isinstance(model, nn.DataParallel) else model).model
+    raw_model = model
     if training and epoch < cfg.BACKBONE.TRAIN_EPOCH:
         for m in raw_model.backbone.modules():
             if isinstance(m, nn.BatchNorm2d):
                 m.eval()
 
+    accum_steps = getattr(cfg.TRAIN, "GRAD_ACCUM_STEPS", 1)
     total, count = 0.0, 0
     ctx = torch.enable_grad() if training else torch.no_grad()
     with ctx:
+        if training:
+            optimizer.zero_grad()
         for step, data in enumerate(loader):
-            template         = to_dev(data["template"],         device)
-            search           = to_dev(data["search"],           device)
-            label_cls        = data["label_cls"].to(device)
-            label_loc        = to_dev(data["label_loc"],        device)
-            label_loc_weight = to_dev(data["label_loc_weight"], device)
-            bbox             = to_dev(data["bbox"],             device)
-
-            outputs = model(template, search, label_cls,
-                            label_loc, label_loc_weight, bbox)
-            # DataParallel gathers scalar losses as [num_gpus] tensors
-            loss = outputs["total_loss"]
-            if isinstance(loss, torch.Tensor) and loss.dim() > 0:
-                loss = loss.mean()
+            batch = {
+                "template":         to_dev(data["template"],         device),
+                "search":           to_dev(data["search"],           device),
+                "label_cls":        data["label_cls"].to(device),
+                "label_loc":        to_dev(data["label_loc"],        device),
+                "label_loc_weight": to_dev(data["label_loc_weight"], device),
+                "bbox":             to_dev(data["bbox"],             device),
+            }
+            outputs = model(batch)
+            loss    = outputs["total_loss"]
 
             if math.isnan(loss.item()) or math.isinf(loss.item()):
                 logger.warning(f"Bad loss at step {step}, skipping.")
                 continue
 
             if training:
-                optimizer.zero_grad()
-                loss.backward()
-                clip_grad_norm_(model.parameters(), cfg.TRAIN.GRAD_CLIP)
-                optimizer.step()
+                # Scale loss by 1/accum_steps so the accumulated gradient
+                # matches what a single forward pass on the full batch would give
+                (loss / accum_steps).backward()
+                is_update_step = (step + 1) % accum_steps == 0 or (step + 1) == len(loader)
+                if is_update_step:
+                    clip_grad_norm_(model.parameters(), cfg.TRAIN.GRAD_CLIP)
+                    optimizer.step()
+                    optimizer.zero_grad()
 
             total += loss.item()
             count += 1
 
             if training and (step + 1) % cfg.TRAIN.PRINT_FREQ == 0:
-                cls_l = outputs.get("cls_loss", torch.tensor(0.))
-                loc_l = outputs.get("loc_loss", torch.tensor(0.))
-                if isinstance(cls_l, torch.Tensor) and cls_l.dim() > 0:
-                    cls_l = cls_l.mean()
-                if isinstance(loc_l, torch.Tensor) and loc_l.dim() > 0:
-                    loc_l = loc_l.mean()
-                cls_l = cls_l.item()
-                loc_l = loc_l.item()
+                cls_l = outputs.get("cls_loss", torch.tensor(0.)).item()
+                loc_l = outputs.get("loc_loss", torch.tensor(0.)).item()
                 logger.info(f"Epoch[{epoch+1}] step[{step+1}/{len(loader)}] "
                             f"loss={loss.item():.4f} cls={cls_l:.4f} loc={loc_l:.4f}")
 
@@ -878,17 +847,11 @@ def main():
     for p in model.backbone.parameters():
         p.requires_grad = False
 
-    # Wrap before moving to device so DataParallel copies the wrapper to each GPU
-    model = ModelForwardWrapper(model).to(device)
+    model = model.to(device)
     n_gpus = torch.cuda.device_count()
-    if n_gpus > 1:
-        model = nn.DataParallel(model)
-        logger.info(f"DataParallel enabled: {n_gpus} GPUs — effective batch = {cfg.TRAIN.BATCH_SIZE}")
-    else:
-        logger.info("Single GPU training")
+    logger.info(f"Found {n_gpus} GPU(s) — single-GPU training with gradient accumulation (accum_steps={cfg.TRAIN.GRAD_ACCUM_STEPS})")
 
-    # Unwrap to actual ModelBuilder for param groups / backbone freeze / checkpointing
-    raw_model = (model.module if isinstance(model, nn.DataParallel) else model).model
+    raw_model = model
 
     # ── datasets ──────────────────────────────────────────────────────────────
     logger.info("=" * 60)
