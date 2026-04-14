@@ -64,7 +64,6 @@ The pipeline trains on 10 IR/thermal datasets covering UAV tracking, maritime, a
 | 5 | **MassMIND** | 2,916 LWIR images | Maritime LWIR | Google Drive (`gdown`) |
 | 6 | **MVSS-Baseline** | Video sequences | RGB-thermal video seg | Google Drive (author approval) |
 | 7 | **DUT-VTUAV** | 500 seqs, 1.7M frames | RGB+Thermal UAV | Google Drive (`gdown --folder`) |
-| 8 | **DUT-Anti-UAV** | IR drone sequences | IR drone tracking | Google Drive (`gdown`) |
 | 9 | **BIRDSAI** | 48 TIR sequences | Aerial wildlife thermal | LILA (`wget`) |
 | 10 | **HIT-UAV** | 2,898 IR images | High-altitude IR detection | Kaggle CLI |
 
@@ -89,9 +88,6 @@ Sample IR frames with ground-truth bounding boxes from each training dataset (4 
 
 **DUT-VTUAV** — RGB+Thermal UAV
 ![DUT-VTUAV](docs/ds_strip_DUT_VTUAV.jpg)
-
-**DUT-Anti-UAV** — IR drone tracking
-![DUT-Anti-UAV](docs/ds_strip_DUT_Anti_UAV.jpg)
 
 
 ---
@@ -161,7 +157,6 @@ Probabilities are **not proportional to dataset size** — smaller, task-critica
 |---------|-----------|--------------|------|
 | AntiUAV410 | 200 | 0.316 | Primary IR UAV target — highest weight |
 | DUT-VTUAV | 225 | 0.263 | Large-scale RGB+Thermal UAV scenes |
-| DUT-Anti-UAV | 20 | 0.211 | IR drone close-up sequences |
 | MSRS | 541 | 0.105 | Paired IR/visible road scenes |
 | MassMIND | 1,801 | 0.105 | Maritime LWIR — largest dataset, downweighted |
 
@@ -229,7 +224,7 @@ python eval_onnx.py \
     --max_frames 150
 ```
 
-Evaluates on 5 test datasets: Anti-UAV410, Anti-UAV300, MSRS, DUT-Anti-UAV, MassMIND.
+Evaluates on 4 test datasets: Anti-UAV410, Anti-UAV300, MSRS, MassMIND.
 
 **Metrics per sequence and per dataset:**
 - Mean IoU

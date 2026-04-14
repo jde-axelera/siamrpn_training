@@ -894,10 +894,6 @@ def main():
     dutvtuav_train = DUTVTUAVDataset(
         c.ROOT, c.ANNO, frame_range=c.FRAME_RANGE) if c else DUTVTUAVDataset("", "")
 
-    c = ds_cfg("DUTANTIUAV")
-    dutantiuav_train = DUTAntiUAVDataset(
-        c.ROOT, c.ANNO, frame_range=c.FRAME_RANGE) if c else DUTAntiUAVDataset("", "")
-
     c = ds_cfg("ANTIUAV300")
     antiuav300_train = AntiUAV300Dataset(
         c.ROOT, c.ANNO, frame_range=c.FRAME_RANGE) if c else AntiUAV300Dataset("", "")
@@ -920,12 +916,12 @@ def main():
     train_ds = CombinedDataset(
         datasets=[
             antiuav_train, msrs_train,    vtmot_train,    massmind_train, mvss_train,
-            dutvtuav_train, dutantiuav_train, antiuav300_train, birdsai_train, hituav_train,
+            dutvtuav_train, antiuav300_train, birdsai_train, hituav_train,
         ],
         weights=[
             w("ANTIUAV410", 3.0), w("MSRS",       1.0), w("VTMOT",    2.0),
             w("MASSMIND",   1.0), w("MVSS",        1.5), w("DUTVTUAV", 2.5),
-            w("DUTANTIUAV", 2.0), w("ANTIUAV300",  2.5), w("BIRDSAI",  1.5),
+            w("ANTIUAV300",  2.5), w("BIRDSAI",  1.5),
             w("HITUAV",     1.0),
         ],
         total_len=cfg.DATASET.VIDEOS_PER_EPOCH,
