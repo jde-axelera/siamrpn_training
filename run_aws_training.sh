@@ -786,25 +786,46 @@ def convert_msrs(data_root, split):
     if os.path.isfile(out):
         print(f"  [MSRS/{split}] already converted, skipping.")
         return
-    ir_dir = os.path.join(data_root, split, "ir")
+    ir_dir  = os.path.join(data_root, split, "ir")
+    lbl_dir = os.path.join(data_root, split, "Segmentation_labels")
     if not os.path.isdir(ir_dir):
         print(f"  [MSRS/{split}] IR folder not found at {ir_dir}, skipping.")
         return
+    import cv2 as _cv2
+    import numpy as _np
+
+    def bbox_from_label(lbl_path, min_area=400):
+        lbl = _cv2.imread(lbl_path, _cv2.IMREAD_GRAYSCALE)
+        if lbl is None:
+            return None
+        fg = (lbl > 0).astype(_np.uint8)
+        n, _, stats, _ = _cv2.connectedComponentsWithStats(fg)
+        if n < 2:
+            return None
+        areas = stats[1:, _cv2.CC_STAT_AREA]
+        best  = int(_np.argmax(areas)) + 1
+        if areas[best-1] < min_area:
+            return None
+        x = int(stats[best, _cv2.CC_STAT_LEFT]);  y = int(stats[best, _cv2.CC_STAT_TOP])
+        w = int(stats[best, _cv2.CC_STAT_WIDTH]); h = int(stats[best, _cv2.CC_STAT_HEIGHT])
+        return [x, y, x+w, y+h]
+
     imgs = sorted(f for f in os.listdir(ir_dir)
                   if f.lower().endswith((".png", ".jpg", ".bmp")))
-    annos = {}
-    # Pair consecutive images as (template, search)
+    annos   = {}
+    skipped = 0
     for i in range(0, len(imgs) - 1, 2):
+        f1, f2 = imgs[i], imgs[i+1]
+        l1 = os.path.join(lbl_dir, f1)
+        l2 = os.path.join(lbl_dir, f2)
+        b1 = bbox_from_label(l1) if os.path.isfile(l1) else [0, 0, 640, 480]
+        b2 = bbox_from_label(l2) if os.path.isfile(l2) else [0, 0, 640, 480]
+        if b1 is None or b2 is None:
+            skipped += 1
+            continue
         seq_name = f"msrs_{split}_{i:05d}"
-        h_dummy, w_dummy = 480, 640   # MSRS default resolution
-        # use full-image bbox (x1,y1,x2,y2) — augmentation handles crop
-        box = [0, 0, w_dummy, h_dummy]
-        annos[seq_name] = {"0": {
-            "000001": box,
-            "000002": box,
-        }}
-        # Store actual filenames as metadata in seq name is enough;
-        # the dataset loader will find images by sorted order
+        annos[seq_name] = {"0": {"000001": b1, "000002": b2}}
+    print(f"  [MSRS/{split}] {skipped} pairs skipped (no foreground object)")
     save_json(annos, out, f"MSRS/{split}")
 
 convert_msrs("${DATA_MSRS}", "train")
