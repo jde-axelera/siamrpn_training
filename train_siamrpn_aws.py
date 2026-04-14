@@ -746,13 +746,16 @@ class ModelForwardWrapper(nn.Module):
 
     def forward(self, template, search, label_cls, label_loc,
                 label_loc_weight, bbox):
+        # .contiguous() is required: DataParallel scatter produces non-contiguous
+        # tensor slices which cause misaligned address errors in pysot's dilated
+        # convolutions (resnet_atrous conv2).
         return self.model({
-            "template":         template,
-            "search":           search,
-            "label_cls":        label_cls,
-            "label_loc":        label_loc,
-            "label_loc_weight": label_loc_weight,
-            "bbox":             bbox,
+            "template":         template.contiguous(),
+            "search":           search.contiguous(),
+            "label_cls":        label_cls.contiguous(),
+            "label_loc":        label_loc.contiguous(),
+            "label_loc_weight": label_loc_weight.contiguous(),
+            "bbox":             bbox.contiguous(),
         })
 
 
