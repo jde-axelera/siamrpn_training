@@ -406,3 +406,53 @@ rclone copy --drive-root-folder-id 1GwYNPcrkUM-gVDAObxNqERi_2Db7okjP --progress 
 ```bash
 watch -n 10 "du -sh /data/dut_vtuav_raw/"
 ```
+
+---
+
+## DUT-VTUAV Dataset Notes
+
+### Annotation Format
+
+The DUT-VTUAV dataset stores video at **10 fps** but ground-truth annotations at **1 fps** — a consistent 10:1 ratio across all sequences. Annotation line `i` maps to frame `i × 10`. The conversion in `run_aws_training.sh` accounts for this.
+
+| Sequence | Video frames | Anno lines | Ratio |
+|----------|-------------|-----------|-------|
+| animal_002 | 6,249 | 625 | 10× |
+| bike_002 | 2,390 | 239 | 10× |
+| excavator_003 | 15,590 | 1,559 | 10× |
+
+### Train / Test Split
+
+Downloaded sequences (250 total) are split **90 / 10**:
+
+| Split | Sequences | Annotated frames |
+|-------|-----------|-----------------|
+| Train | 225 | 52,640 |
+| Test  | 25 | 5,738 |
+
+### Sample Annotations
+
+Six IR frames with ground-truth bounding boxes (green) across object categories:
+
+| Excavator | Car | Pedestrian |
+|-----------|-----|-----------|
+| ![excavator](docs/sample_01_excavator_003.jpg) | ![car](docs/sample_02_car_045.jpg) | ![pedestrian](docs/sample_03_pedestrian_049.jpg) |
+| ![bus](docs/sample_04_bus_002.jpg) | ![animal](docs/sample_05_animal_002.jpg) | ![bike](docs/sample_06_bike_002.jpg) |
+
+### Single-Sequence Tracking Strip
+
+Three frames from `excavator_003` (start · mid · end) showing the bounding box tracking the object across 15,580 frames:
+
+![tracking strip](docs/track_strip_excavator.jpg)
+
+---
+
+## Known Fixes
+
+| Date | Issue | Fix |
+|------|-------|-----|
+| 2026-04-13 | `gdown --fuzzy` removed in gdown 6.x | Removed flag from all 7 calls |
+| 2026-04-13 | Root partition fills on small AWS volumes | `--install-dir` flag redirects all writes to data partition |
+| 2026-04-14 | `DataParallel` breaks pysot dict-based `forward` in PyTorch 2.x | Disabled `DataParallel`; single-GPU training |
+| 2026-04-14 | `model_builder.py` calls `next(self.parameters()).device` inside DataParallel replica | Changed to `data['template'].device` |
+| 2026-04-14 | DUT-VTUAV annotations mapped to wrong frames | Frame key = `i × 10` not `i + 1` (1 fps annos, 10 fps video) |
