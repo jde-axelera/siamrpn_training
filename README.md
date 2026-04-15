@@ -22,6 +22,7 @@ Built on [PySOT](https://github.com/STVIR/pysot). Designed to run on AWS GPU ins
 12. [Directory Layout](#12-directory-layout)
 13. [Operations & Advanced](#13-operations--advanced)
 14. [Changelog & Development Notes](#14-changelog--development-notes)
+15. [Training Bug: Dataset Preprocessing Root Cause Analysis](#15-training-bug-dataset-preprocessing-root-cause-analysis)
 
 ---
 
@@ -1021,6 +1022,229 @@ The README was rewritten from a pure operational reference into an educational d
 | §6 Training Details | Sampling probability table with rationale per dataset; LR schedule timeline diagram |
 | §7 Multi-GPU (DDP) | Full DDP background section (see §7) |
 | §10 Inference hyperparameters | Plain-English "what it does" column for every tracker parameter |
+
+
+---
+
+## 15. Training Bug: Dataset Preprocessing Root Cause Analysis
+
+> **Date:** 2026-04-15  
+> **Severity:** Critical — the entire training run produced a non-functional model  
+> **Status:** Fixed and re-training in progress
+
+---
+
+### Symptom
+
+The tracker trained for 140 epochs with a final training loss of **0.26** — seemingly good convergence. However:
+
+- On `ir_crop.mp4`: tracker drifts to the top-right corner within 15 frames, confidence 0.97–0.99 throughout
+- On **Anti-UAV 410 training sequences** (data the model was trained on): **Mean IoU = 0.000** across all tested sequences
+- Score heatmap peaks 40–50 px away from actual target with 0.97–0.99 confidence
+
+The model tracked the wrong location on its own training data. This confirmed the model was fundamentally broken, not just under-trained.
+
+---
+
+### Investigation
+
+**Step 1 — Rule out inference bugs.** The init box was verified visually to lie on the target. Rotation (−90° CCW) was confirmed correct by comparing scores: CCW gave 0.661 vs CW 0.547. Preprocessing was confirmed correct (raw 0–255 BGR float32).
+
+**Step 2 — Test on training data.** Running the PyTorch tracker on three Anti-UAV 410 training sequences:
+
+| Sequence | Frames tracked | Mean IoU | Observation |
+|---|---|---|---|
+| `01_1667_0001-1500` | 50 | 0.003 | Drifts to top-right corner from frame 1 |
+| `01_1751_0250-1750` | 50 | 0.009 | Same pattern, high confidence (0.7–0.8) |
+| `01_2192_0001-1500` | 50 | 0.000 | Drifts immediately, confidence 0.89–0.97 |
+
+All sequences show the identical drift pattern: **x increases, y decreases every frame** toward the top-right, with high confidence. This is impossible if training worked correctly.
+
+**Step 3 — Trace the dataflow.** Reading `train_siamrpn_aws.py` alongside PySOT's `augmentation.py` revealed two compounding bugs.
+
+---
+
+### Root Cause: Two Bugs in the Preprocessing Pipeline
+
+PySOT's `Augmentation` class was designed for one specific input format: **pre-cropped square patches with the target at the image centre**. The custom dataset classes passed **full rectangular video frames** instead. This violated the core assumption of the entire pipeline.
+
+#### Bug 1 — `Augmentation.__call__` ignores the annotation position
+
+`pysot/pysot/datasets/augmentation.py`, line 119:
+
+```python
+def __call__(self, image, bbox, size, gray=False):
+    shape = image.shape
+    crop_bbox = center2corner(Center(shape[0]//2, shape[1]//2, size-1, size-1))
+    #                                 ^^^^^^^^^^^  ^^^^^^^^^^^
+    #                                 H//2 used as X   W//2 used as Y  ← SWAPPED for non-square
+    image, bbox = self._shift_scale_aug(image, bbox, crop_bbox, size)
+```
+
+The crop is always centred at `(shape[0]//2, shape[1]//2)` — which swaps height and width for non-square images, AND ignores the annotation position entirely. For a 640×512 frame:
+
+| What it should be | What it was |
+|---|---|
+| Crop centred on annotation at e.g. (320, 264) | Crop centred at (256, 320) — off-centre AND swapped |
+| 127×127 region around the drone | 126×126 region from the wrong part of the image |
+
+For a 640×512 image with `size=127`, the augmented crop covers only **20% of image width** and **25% of image height**. If the drone is not in that central strip, the template/search patches contain **only background**.
+
+#### Bug 2 — `_get_bbox` also uses image centre, not annotation centre
+
+`train_siamrpn_aws.py`, both `AntiUAV410Dataset._get_bbox` and `IRTrackingDatasetBase._get_bbox`:
+
+```python
+def _get_bbox(self, image, anno):
+    if len(anno) == 4:
+        x1, y1, x2, y2 = anno
+        w, h = x2 - x1, y2 - y1
+    # BUG: annotation centre is completely ignored for position
+    cx, cy = image.shape[1]//2, image.shape[0]//2   # ← always image centre
+    return center2corner(Center(cx, cy, w*sc, h*sc))
+```
+
+The annotation's `(x1, y1, x2, y2)` is used only to compute box **dimensions** — the centre `(cx, cy)` is hardcoded to the image centre. So the bounding box fed to `AnchorTarget` is always centred at `(W//2, H//2)` regardless of where the annotation actually is.
+
+#### Combined effect
+
+Training pairs were constructed as follows:
+
+1. Full frame loaded (e.g. 640×512 with drone at annotation position)
+2. Augmentation crops **126×126 pixels from the wrong location** in the frame
+3. `AnchorTarget` receives a bbox claiming the target is at **image centre** regardless of where the drone is
+4. Over 140 epochs the model learns: *"when cross-correlating two random background patches, output a high-confidence response at a consistent offset from centre"*
+
+The low training loss (0.26) reflects the model memorising a spurious statistical pattern in the background, not learning to track targets.
+
+**Why this was hidden:** For sequences where the drone happens to be near the image centre (e.g. Anti-UAV 410 has many centred shots), some training pairs were approximately correct. Loss appeared to decrease, giving a false signal of progress.
+
+---
+
+### The Fix: `_get_center_crop()`
+
+Added a standalone helper `_get_center_crop()` in `train_siamrpn_aws.py` before the dataset classes:
+
+```python
+def _get_center_crop(image, anno, output_size, exemplar_size):
+    """
+    Extract a square crop of `output_size` pixels centred on `anno`,
+    then resize to output_size × output_size.
+    
+    This ensures the target annotation is at the IMAGE CENTRE of the
+    returned crop — the prerequisite for PySOT's Augmentation pipeline.
+    """
+    x1, y1, x2, y2 = anno
+    w, h = x2-x1, y2-y1
+    cx, cy = (x1+x2)/2, (y1+y2)/2              # actual annotation centre
+    
+    context = 0.5 * (w + h)
+    s_z = sqrt((w + context) * (h + context))  # PySOT context window
+    
+    # Extract s_z × (output_size/exemplar_size) pixels from original image,
+    # centred on the annotation, then resize to output_size.
+    orig_crop_size = s_z * (output_size / exemplar_size)
+    # ... pad and crop centred at (cx, cy) ...
+    # Returns: (output_size×output_size image, new_anno at image centre)
+```
+
+Both `AntiUAV410Dataset.__getitem__` and `IRTrackingDatasetBase.__getitem__` now call this before passing to `Augmentation`:
+
+```python
+# Before (broken):
+template, _ = self.template_aug(t_img,   self._get_bbox(t_img,   t_anno), 127)
+search,   _ = self.search_aug(  s_img,   self._get_bbox(s_img,   s_anno), 255)
+
+# After (fixed):
+t_crop, t_anno_c = _get_center_crop(t_img, t_anno, 254, 127)   # 254 = 2× exemplar
+s_crop, s_anno_c = _get_center_crop(s_img, s_anno, 510, 127)   # 510 = 2× search
+template, _ = self.template_aug(t_crop, self._get_bbox(t_crop, t_anno_c), 127)
+search,   _ = self.search_aug(  s_crop, self._get_bbox(s_crop, s_anno_c), 255)
+```
+
+**Why 2× size for Augmentation input:**
+- Template: 254×254 input → Augmentation crops 126×126 from centre → ±4px shift stays within bounds  
+- Search: 510×510 input → Augmentation crops 254×254 from centre → ±64px shift positions target randomly within 255×255 output
+
+After the fix, `_get_bbox` receives a **square** image so `shape[0]//2 = shape[1]//2` — the swap bug cancels out and the centre is correct.
+
+---
+
+### Validation
+
+**Sanity check:** `_get_center_crop` with Anti-UAV 410 annotation `[298, 247, 342, 281]`:
+```
+Template crop: (254, 254, 3)   new_anno centre: (127.0, 127.0) ✓
+Search   crop: (510, 510, 3)   new_anno centre: (255.0, 255.0) ✓
+```
+
+**Gradient flow (10 steps, 8 real samples):**
+
+| Step | Total loss | Cls loss | Loc loss |
+|---|---|---|---|
+| 1 | 2.181 | 1.297 | 0.737 |
+| 5 | 1.380 | 0.026 | 1.128 |
+| 10 | 1.202 | 0.023 | 0.983 |
+
+Starting loss ~2.18 (realistic for SiamRPN++) vs the broken model's ~0.26. The model is learning.
+
+**Re-training convergence:**
+
+| Epoch | Train loss | Val loss |
+|---|---|---|
+| 1 | 1.692 | 1.453 |
+| 2 | 1.247 | 1.120 |
+| 3 | 1.010 | 0.914 |
+| 4 | 0.853 | 0.783 |
+
+Healthy monotonic decrease. Re-training is ongoing.
+
+---
+
+### Dataflow Debug Visualisation
+
+A comprehensive visualisation script (`debug_dataflow.py`) was written to inspect every step of the preprocessing pipeline for all four active datasets. For each dataset, 3 random training pairs are shown across 5 steps:
+
+| Step | What is shown |
+|---|---|
+| **Step 0 — Raw input** | Full frame with GT annotation box (green). Coordinates, size, aspect ratio printed. |
+| **Step 1 — Center crop** | 254×254 template / 510×510 search after `_get_center_crop`. Orange box = new annotation. White crosshair = image centre (should coincide with annotation centre). |
+| **Step 2 — Augmentation** | 127×127 template / 255×255 search after `Augmentation`. Gold box = `_get_bbox` output. Blue box = `aug_bbox` passed to `AnchorTarget`. |
+| **Step 3 — Anchor labels** | 25×25 cls map (red=positive, grey=negative, yellow=ignore). Positive anchor centres overlaid on search. Regression delta heatmap. |
+| **Step 4 — Model tensors** | Individual B/G channels as heatmaps. Tensor stats: shape, min, max, mean, std. Confirms raw 0–255 float32 (no normalisation). |
+
+**Anti-UAV 410 — Sample 1**
+![Anti-UAV 410 sample 1](docs/debug_images/dataflow_antiuav_410_s1.png)
+
+**Anti-UAV 410 — Sample 3** (different sequence)
+![Anti-UAV 410 sample 3](docs/debug_images/dataflow_antiuav_410_s3.png)
+
+**MSRS — Sample 1** (paired IR/visible, road scene)
+![MSRS sample 1](docs/debug_images/dataflow_msrs_s1.png)
+
+**MassMIND — Sample 1** (aerial IR)
+![MassMIND sample 1](docs/debug_images/dataflow_massmind_s1.png)
+
+**DUT-VTUAV — Sample 1** (IR UAV, large frame)
+![DUT-VTUAV sample 1](docs/debug_images/dataflow_dutvtuav_s1.png)
+
+The full 13-page PDF with all samples is at [`debug_dataflow.pdf`](debug_dataflow.pdf).
+
+To regenerate:
+```bash
+cd /data/siamrpn_training
+python debug_dataflow.py
+# Output: debug_dataflow.pdf + docs/debug_images/*.png
+```
+
+---
+
+### Lessons Learned
+
+1. **Always verify training pairs visually** before running a long training job. A single call to `debug_dataflow.py` would have caught this immediately.
+2. **Test on training data first.** If a model cannot track sequences it was trained on, the training pipeline is broken regardless of loss values.
+3. **Low training loss does not mean correct training.** The model achieved 0.26 loss by memorising a spurious background correlation pattern. Always sanity-check with IoU on held-out tracking sequences.
+4. **PySOT Augmentation assumes pre-cropped inputs.** The `Augmentation` class was designed for square patches with target at centre. Never pass full rectangular frames directly.
 
 
 ---

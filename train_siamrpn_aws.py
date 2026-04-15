@@ -85,6 +85,78 @@ def to_dev(t, device):
            else t.to(device)
 
 
+
+def _get_center_crop(image, anno, output_size, exemplar_size):
+    """
+    Extract a square crop of `output_size` pixels centered on `anno`,
+    padding with the image mean at boundaries.
+
+    This pre-crops the full frame so that the annotation target is at the
+    center of the returned image — a prerequisite for PySOT's Augmentation
+    pipeline, which assumes the target is at the image center.
+
+    Args:
+        image       : BGR uint8 numpy array (H×W×3)
+        anno        : [x1,y1,x2,y2] or [w,h] in image pixel coords
+        output_size : desired square output size (e.g. 254 for template, 510 for search)
+        exemplar_size: cfg.TRAIN.EXEMPLAR_SIZE (127)
+
+    Returns:
+        crop    : uint8 BGR array of shape (output_size, output_size, 3)
+        new_anno: [x1,y1,x2,y2] in crop pixel coords (target at center)
+    """
+    if len(anno) == 4:
+        ax1, ay1, ax2, ay2 = [float(v) for v in anno]
+        w, h = ax2 - ax1, ay2 - ay1
+        cx, cy = (ax1 + ax2) / 2.0, (ay1 + ay2) / 2.0
+    else:
+        w, h = float(anno[0]), float(anno[1])
+        cx, cy = image.shape[1] / 2.0, image.shape[0] / 2.0
+
+    w = max(w, 1.0); h = max(h, 1.0)  # guard against degenerate boxes
+
+    context = 0.5 * (w + h)
+    s_z = np.sqrt((w + context) * (h + context))  # PySOT exemplar window size
+
+    # How many original-image pixels should map to output_size pixels
+    # so that the target fills ~exemplar_size pixels in the output.
+    orig_crop_size = s_z * (output_size / exemplar_size)
+
+    avg_chans = image.mean(axis=(0, 1)).tolist()
+    H, W = image.shape[:2]
+
+    half = orig_crop_size / 2.0
+    x0 = int(np.floor(cx - half + 0.5))
+    y0 = int(np.floor(cy - half + 0.5))
+    x1c = x0 + int(orig_crop_size)
+    y1c = y0 + int(orig_crop_size)
+
+    lp = max(0, -x0);   tp = max(0, -y0)
+    rp = max(0, x1c - W); bp = max(0, y1c - H)
+
+    if any([lp, tp, rp, bp]):
+        img_pad = cv2.copyMakeBorder(
+            image, tp, bp, lp, rp,
+            cv2.BORDER_CONSTANT, value=avg_chans)
+        crop = img_pad[y0+tp : y1c+tp, x0+lp : x1c+lp]
+    else:
+        crop = image[y0:y1c, x0:x1c]
+
+    if crop.shape[0] == 0 or crop.shape[1] == 0:
+        crop = np.full((output_size, output_size, 3), avg_chans, dtype=np.uint8)
+    else:
+        crop = cv2.resize(crop, (output_size, output_size))
+
+    # Annotation in crop coords: target should be at (output_size/2, output_size/2)
+    scale = output_size / orig_crop_size
+    new_cx, new_cy = output_size / 2.0, output_size / 2.0
+    new_w, new_h = w * scale, h * scale
+    new_anno = [new_cx - new_w/2, new_cy - new_h/2,
+                new_cx + new_w/2, new_cy + new_h/2]
+
+    return crop, new_anno
+
+
 # ── Dataset ───────────────────────────────────────────────────────────────────
 class AntiUAV410Dataset(Dataset):
     def __init__(self, root, anno_path, frame_range=50, epoch_len=None):
@@ -152,9 +224,17 @@ class AntiUAV410Dataset(Dataset):
         s_anno = track[f"{sf:06d}"]
         gray   = cfg.DATASET.GRAY and cfg.DATASET.GRAY > random.random()
 
-        template, _ = self.template_aug(t_img, self._get_bbox(t_img, t_anno),
+        # Pre-crop around annotation center so Augmentation receives a square
+        # image with the target at center (PySOT's required input format).
+        t_crop, t_anno_c = _get_center_crop(t_img, t_anno,
+                                             cfg.TRAIN.EXEMPLAR_SIZE * 2,
+                                             cfg.TRAIN.EXEMPLAR_SIZE)
+        s_crop, s_anno_c = _get_center_crop(s_img, s_anno,
+                                             cfg.TRAIN.SEARCH_SIZE * 2,
+                                             cfg.TRAIN.EXEMPLAR_SIZE)
+        template, _ = self.template_aug(t_crop, self._get_bbox(t_crop, t_anno_c),
                                         cfg.TRAIN.EXEMPLAR_SIZE, gray=gray)
-        search, bbox = self.search_aug(s_img, self._get_bbox(s_img, s_anno),
+        search, bbox = self.search_aug(s_crop, self._get_bbox(s_crop, s_anno_c),
                                        cfg.TRAIN.SEARCH_SIZE, gray=gray)
         cls, delta, delta_weight, _ = self.anchor_target(
             bbox, cfg.TRAIN.OUTPUT_SIZE, neg=False)
@@ -288,11 +368,18 @@ class IRTrackingDatasetBase(Dataset):
         s_anno = track.get(f"{sf:06d}", track[next(iter(track))])
         gray   = cfg.DATASET.GRAY and cfg.DATASET.GRAY > random.random()
 
-        template, _ = self.template_aug(t_img, self._get_bbox(t_img, t_anno),
+        # Pre-crop around annotation center so Augmentation receives a square
+        # image with the target at center (PySOT's required input format).
+        s_img_eff = s_img if s_img is not None else t_img
+        t_crop, t_anno_c = _get_center_crop(t_img, t_anno,
+                                             cfg.TRAIN.EXEMPLAR_SIZE * 2,
+                                             cfg.TRAIN.EXEMPLAR_SIZE)
+        s_crop, s_anno_c = _get_center_crop(s_img_eff, s_anno,
+                                             cfg.TRAIN.SEARCH_SIZE * 2,
+                                             cfg.TRAIN.EXEMPLAR_SIZE)
+        template, _ = self.template_aug(t_crop, self._get_bbox(t_crop, t_anno_c),
                                         cfg.TRAIN.EXEMPLAR_SIZE, gray=gray)
-        search, bbox = self.search_aug(s_img if s_img is not None else t_img,
-                                       self._get_bbox(s_img if s_img is not None else t_img,
-                                                      s_anno),
+        search, bbox = self.search_aug(s_crop, self._get_bbox(s_crop, s_anno_c),
                                        cfg.TRAIN.SEARCH_SIZE, gray=gray)
         cls, delta, delta_weight, _ = self.anchor_target(
             bbox, cfg.TRAIN.OUTPUT_SIZE, neg=False)
