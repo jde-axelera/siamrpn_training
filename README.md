@@ -28,6 +28,7 @@ Built on [PySOT](https://github.com/STVIR/pysot). Designed to run on AWS GPU ins
 18. [Findings from Debug Analysis](#18-findings-from-debug-analysis)
 19. [Recommendations](#19-recommendations)
 20. [Advanced Tracker: Dual Template + Gallery](#20-advanced-tracker-dual-template--gallery)
+21. [SAM-Based Video Segmentation](#21-sam-based-video-segmentation)
 
 ---
 
@@ -1625,7 +1626,116 @@ cyan = gallery template driving loc.
 
 ---
 
+## 21. SAM-Based Video Segmentation
+
+Runs **SAMv2.1** (Segment Anything Model 2.1) on `ir_crop.mp4` using the
+[muggled_sam](https://github.com/heyoeyo/muggled_sam) library.  
+Script: `run_sam_video.py` — fully headless, no display required.
+
+### Setup on AWS
+
+```bash
+cd /data
+git clone https://github.com/heyoeyo/muggled_sam
+pip install -r /data/muggled_sam/requirements.txt
+
+# SAMv2.1 large — freely downloadable (~857 MB)
+wget 'https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_large.pt'   -O /data/muggled_sam/model_weights/sam2.1_hiera_large.pt
+```
+
+### Run
+
+```bash
+python run_sam_video.py     --model  /data/muggled_sam/model_weights/sam2.1_hiera_large.pt     --video  ir_crop.mp4     --rotate -90     --init_box 339 148 391 232     --out    ir_crop_sam_seg.mp4
+```
+
+`--init_box` is in original (pre-rotation) frame coordinates `[x1 y1 x2 y2]`.  
+The script transforms it to rotated-frame coordinates, normalises to `[0,1]`,
+and passes it as a SAM box prompt on frame 0. All subsequent frames are
+propagated automatically via SAM's video memory mechanism.
+
+### How it works
+
+1. **Frame 0** — init box `[339,148,391,232]` → rotated to `[148,248,232,300]`
+   → normalised `(0.308,0.388)–(0.483,0.469)`.  
+   `sammodel.encode_image(frame0)` + `initialize_video_masking(box)` → initial mask + memory.
+2. **Every subsequent frame** — `sammodel.encode_image(frame)` (backbone, ~140 ms) +  
+   `sammodel.step_video_masking(enc, prompt_mems, prompt_ptrs, prev_mems, prev_ptrs)` (decoder, ~5 ms).  
+   `obj_score ≥ 0` → memory updated; `obj_score < 0` → mask shown but memory frozen.
+3. **Render** — mask upsampled to frame size, overlaid as a semi-transparent green region,
+   contour drawn, bounding box from mask extent labelled with `obj_score`.
+
+### Output video `ir_crop_sam_seg.mp4`
+
+| Property | Value |
+|----------|-------|
+| Resolution | 480 × 640 (after −90° rotation) |
+| Frames | 5966 |
+| Encoding speed | ~140 ms encode + ~5 ms track = **~7 fps** |
+| Model | SAMv2.1 large (857 MB) |
+| Prompt | Bounding box on frame 0 |
+
+### Results
+
+| Segment | Tracked? | Notes |
+|---------|----------|-------|
+| 0–600 | Yes | Clean segmentation, mask ~900 px, centroid tracks correctly |
+| 600–900 | Degraded | Mask shrinks to ~100 px |
+| 900–1500 | Lost | `obj_score` negative, mask absent |
+| 1500–1800 | Recovered | SAM re-acquires target |
+| 1800–3000 | Lost | Extended loss |
+| 3000–3300 | Recovered | Brief reacquisition |
+| 4500–5000 | Recovered | Centroid at ~(203, 126) — target near top |
+| 5100–5700 | Tracking wrong region | Centroid drifts to (454, 617) then (369, 539) — false lock |
+
+**50% of sampled frames show a meaningful mask.**  
+Patchy tracking is expected — SAMv2.1 was trained exclusively on RGB video.
+IR imagery has fundamentally different texture statistics (thermal gradients vs.
+colour gradients), so the video memory mechanism loses coherence when the target
+appearance changes abruptly between frames.
+
+### SAMv3
+
+SAMv3 adds a dedicated **detection head** (no prompt required — it finds objects
+automatically each frame) on top of the same mask decoder as SAMv2.1.
+The `run_sam_video.py` script auto-detects the model version and supports SAMv3
+with no code changes.
+
+SAMv3 weights are gated behind a HuggingFace licence agreement:
+
+```bash
+# 1. Accept licence at https://huggingface.co/facebook/sam3
+# 2. Create a token at https://huggingface.co/settings/tokens
+huggingface-cli login   # paste token when prompted
+huggingface-cli download facebook/sam3 sam3.pt   --local-dir /data/muggled_sam/model_weights/
+
+# 3. Re-run — same command, just swap the model path
+python run_sam_video.py     --model  /data/muggled_sam/model_weights/sam3.pt     --video  ir_crop.mp4 --rotate -90     --init_box 339 148 391 232     --out    ir_crop_sam3_seg.mp4
+```
+
+### Comparison: SiamRPN++ vs SAMv2.1
+
+| Aspect | SiamRPN++ (`best_model.pth`) | SAMv2.1 Large |
+|--------|-------------------------------|---------------|
+| Paradigm | Siamese cross-correlation | Transformer memory-based |
+| Prompt | Bounding box → tracked state | Bounding box → mask |
+| Output | Bounding box only | Pixel-level segmentation mask |
+| Speed | ~120 fps (GPU) | ~7 fps (GPU) |
+| IR tracking (0–2000f) | Medium (score 0.5–0.7) | Tracked ~50% of frames |
+| IR tracking (2000–4000f) | Degrades (score 0.3–0.6) | Mostly lost |
+| Recovery after loss | Partial (gallery approach helps) | Sporadic |
+| Trained on IR? | Yes (fine-tuned) | No (RGB only) |
+| Segmentation mask | No | Yes |
+
+SiamRPN++ (with R1/R2/R3 fixes) provides more consistent bounding-box tracking
+on this IR video. SAMv2.1 produces pixel-level segmentation masks when it does
+track, but loses coherence more often due to the RGB-trained memory mechanism
+struggling with IR appearance statistics.
+
+---
+
 ## References
+
 
 - **SiamRPN++**: Li et al., CVPR 2019 — [paper](https://arxiv.org/abs/1812.11703)
 - **PySOT**: [github.com/STVIR/pysot](https://github.com/STVIR/pysot)
