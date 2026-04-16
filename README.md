@@ -1713,6 +1713,36 @@ huggingface-cli download facebook/sam3 sam3.pt   --local-dir /data/muggled_sam/m
 python run_sam_video.py     --model  /data/muggled_sam/model_weights/sam3.pt     --video  ir_crop.mp4 --rotate -90     --init_box 339 148 391 232     --out    ir_crop_sam3_seg.mp4
 ```
 
+### Visual comparison: SAMv2.1 vs SiamRPN++ (R1/R2/R3)
+
+Left: SAMv2.1 (green mask overlay). Right: SiamRPN++ with R1/R2/R3 fixes (yellow bbox).
+
+**Frame 100 — both trackers on target:**
+
+![Frame 100](docs/sam_vs_siam_f0100.jpg)
+
+**Frame 600 — SAMv2.1 mask shrinking, SiamRPN++ stable:**
+
+![Frame 600](docs/sam_vs_siam_f0600.jpg)
+
+**Frame 1500 — SAMv2.1 recovered, SiamRPN++ also tracking:**
+
+![Frame 1500](docs/sam_vs_siam_f1500.jpg)
+
+**Frame 3000 — brief SAM reacquisition:**
+
+![Frame 3000](docs/sam_vs_siam_f3000.jpg)
+
+**Frame 4800 — SAMv2.1 tracking near top of frame, SiamRPN++ holding:**
+
+![Frame 4800](docs/sam_vs_siam_f4800.jpg)
+
+**Frame 5100 — SAMv2.1 false-lock (drifted to background), SiamRPN++ lost:**
+
+![Frame 5100](docs/sam_vs_siam_f5100.jpg)
+
+---
+
 ### Comparison: SiamRPN++ vs SAMv2.1
 
 | Aspect | SiamRPN++ (`best_model.pth`) | SAMv2.1 Large |
