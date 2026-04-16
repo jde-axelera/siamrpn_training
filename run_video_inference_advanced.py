@@ -55,6 +55,7 @@ from collections import deque
 import cv2, numpy as np, torch
 import torch.nn.functional as F
 
+
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PYSOT_DIR  = os.path.join(SCRIPT_DIR, 'pysot')
 if os.path.isdir(PYSOT_DIR):
@@ -66,7 +67,17 @@ from pysot.tracker.siamrpn_tracker import SiamRPNTracker
 
 
 # ── tunable constants ─────────────────────────────────────────────────────────
-R2_MAX_SX_FACTOR   = 2.5    # hard cap on search area: s_x ≤ this × s_z_init
+# Fix 1 — Decouple s_x from bbox size.
+# The positive feedback loop: large bbox → large s_x → object appears tiny in
+# the 255×255 crop → only large anchors have high IoU → regression predicts
+# only small delta from large anchor → bbox stays large → repeat.
+# Locking s_x to the initial scale breaks this loop entirely.  The model
+# always processes the search patch at the same scale as during initialisation,
+# so predictions for smaller/larger objects are made at the correct scale.
+FIX1_SX_LOCK       = True   # lock s_x to initial scale (breaks feedback loop)
+SX_LOCK_FACTOR     = 1.0    # s_x = SX_LOCK_FACTOR × s_x_init  (1.0 = full lock)
+
+R2_MAX_SX_FACTOR   = 2.5    # fallback cap when FIX1_SX_LOCK is False: s_x ≤ this × s_z_init
 R3_SIZE_THRESH     = 0.55   # freeze bbox size when score drops below this
 
 GALLERY_SIZE       = 5      # ring-buffer capacity (slots)
@@ -166,17 +177,31 @@ class AdvancedTracker(SiamRPNTracker):
     # ── main tracking step ────────────────────────────────────────────────────
     def track(self, img):
 
-        # R2 — compute s_x with hard cap
-        w_z     = self.size[0] + cfg.TRACK.CONTEXT_AMOUNT * np.sum(self.size)
-        h_z     = self.size[1] + cfg.TRACK.CONTEXT_AMOUNT * np.sum(self.size)
-        s_z     = np.sqrt(w_z * h_z)
-        scale_z = cfg.TRACK.EXEMPLAR_SIZE / s_z
+        if FIX1_SX_LOCK:
+            # Fix 1: Decouple s_x from current bbox estimate.
+            # Lock s_x and scale_z to the initial values so the model always
+            # processes the search patch at the scale it saw during init.
+            # This breaks the positive feedback loop: bbox grows → s_x grows
+            # → target appears tiny in crop → only large anchors fire →
+            # bbox refuses to shrink.  With s_x locked, the target appears
+            # at its true relative size, allowing the model to predict the
+            # correct (smaller) bbox when it moves away.
+            s_x     = SX_LOCK_FACTOR * self._init_s_z * (
+                cfg.TRACK.INSTANCE_SIZE / cfg.TRACK.EXEMPLAR_SIZE)
+            scale_z = cfg.TRACK.EXEMPLAR_SIZE / (s_x * cfg.TRACK.EXEMPLAR_SIZE
+                                                 / cfg.TRACK.INSTANCE_SIZE)
+        else:
+            # Original path: R2 hard cap (retained for ablation via --no_fix1)
+            w_z     = self.size[0] + cfg.TRACK.CONTEXT_AMOUNT * np.sum(self.size)
+            h_z     = self.size[1] + cfg.TRACK.CONTEXT_AMOUNT * np.sum(self.size)
+            s_z     = np.sqrt(w_z * h_z)
+            scale_z = cfg.TRACK.EXEMPLAR_SIZE / s_z
 
-        s_x_raw = s_z * (cfg.TRACK.INSTANCE_SIZE / cfg.TRACK.EXEMPLAR_SIZE)
-        s_x     = min(s_x_raw, R2_MAX_SX_FACTOR * self._init_s_z)
-        if s_x < s_x_raw:
-            s_z_eff = s_x * cfg.TRACK.EXEMPLAR_SIZE / cfg.TRACK.INSTANCE_SIZE
-            scale_z = cfg.TRACK.EXEMPLAR_SIZE / s_z_eff
+            s_x_raw = s_z * (cfg.TRACK.INSTANCE_SIZE / cfg.TRACK.EXEMPLAR_SIZE)
+            s_x     = min(s_x_raw, R2_MAX_SX_FACTOR * self._init_s_z)
+            if s_x < s_x_raw:
+                s_z_eff = s_x * cfg.TRACK.EXEMPLAR_SIZE / cfg.TRACK.INSTANCE_SIZE
+                scale_z = cfg.TRACK.EXEMPLAR_SIZE / s_z_eff
 
         x_crop = self.get_subwindow(img, self.center_pos,
                                     cfg.TRACK.INSTANCE_SIZE,
@@ -333,6 +358,10 @@ def run(args):
     if cfg.CUDA:
         model = model.cuda()
 
+    # Apply Fix 1 setting from CLI
+    global FIX1_SX_LOCK
+    FIX1_SX_LOCK = not args.no_fix1
+
     use_gallery = not args.no_gallery
     use_dual    = not args.no_dual
     tracker     = AdvancedTracker(model, use_gallery=use_gallery, use_dual=use_dual)
@@ -349,13 +378,14 @@ def run(args):
     print(f"Model     : {args.ckpt}")
     print(f"Video     : {args.video}  ({width}×{height}  {fps:.1f}fps  {total} frames)")
     print(f"Rotate    : {rotate:+d}°  output {out_w}×{out_h}")
+    print(f"Fix 1 s_x : {'LOCKED to ' + str(SX_LOCK_FACTOR) + '× init scale' if FIX1_SX_LOCK else 'OFF  (R2 cap=' + str(R2_MAX_SX_FACTOR) + '× init)'}")
     print(f"Gallery   : {'ON  size=' + str(GALLERY_SIZE) + '  thresh=' + str(GALLERY_UPD_THRESH) if use_gallery else 'OFF'}")
     print(f"Dual tmpl : {'ON  W_init=' + str(DUAL_W_INIT) + '  W_dyn=' + str(DUAL_W_DYN) + '  EMA_α=' + str(EMA_ALPHA) if use_dual else 'OFF'}")
-    print(f"R2 s_x cap: {R2_MAX_SX_FACTOR}× s_z_init")
     print(f"R3 size gate: score >= {R3_SIZE_THRESH}")
 
     base      = os.path.splitext(os.path.basename(args.video))[0]
-    out_video = args.out or f"{base}_advanced.mp4"
+    suffix    = '_fix1' if FIX1_SX_LOCK else '_advanced'
+    out_video = args.out or f"{base}{suffix}.mp4"
     out_csv   = out_video.replace('.mp4', '_results.csv')
     writer    = cv2.VideoWriter(out_video,
                                 cv2.VideoWriter_fourcc(*'mp4v'),
@@ -445,4 +475,6 @@ if __name__ == '__main__':
                     help='disable template gallery; use EMA dual-template only')
     ap.add_argument('--no_dual',    action='store_true',
                     help='disable dual-template blending; gallery winner used directly')
+    ap.add_argument('--no_fix1',    action='store_true',
+                    help='disable Fix1 s_x locking; revert to R2 hard cap at 2.5× init')
     run(ap.parse_args())

@@ -29,6 +29,7 @@ Built on [PySOT](https://github.com/STVIR/pysot). Designed to run on AWS GPU ins
 19. [Recommendations](#19-recommendations)
 20. [Advanced Tracker: Dual Template + Gallery](#20-advanced-tracker-dual-template--gallery)
 21. [SAM-Based Video Segmentation](#21-sam-based-video-segmentation)
+22. [Fix 1: Decoupling Search-Area Size from Bounding Box](#22-fix-1-decoupling-search-area-size-from-bounding-box)
 
 ---
 
@@ -1763,6 +1764,155 @@ track, but loses coherence more often due to the RGB-trained memory mechanism
 struggling with IR appearance statistics.
 
 ---
+
+
+---
+
+## 22. Fix 1: Decoupling Search-Area Size from Bounding Box
+
+### Root cause: the positive feedback loop
+
+SiamRPN++ computes its search-area size `s_x` from the **current bounding-box
+estimate**:
+
+```
+s_x = sqrt((w + pad) * (h + pad)) * (INSTANCE_SIZE / EXEMPLAR_SIZE)
+```
+
+Once the bbox estimate grows (e.g. due to background contamination or an
+anchor prediction bias), `s_x` grows with it.  A larger search crop means the
+target occupies a smaller fraction of the 255×255 patch, so the anchor that
+wins cross-correlation is a large anchor, whose regression target is a small
+delta — keeping the box large.  This creates a one-way ratchet:
+
+```
+large bbox → large s_x → target appears tiny in crop
+         → large anchor fires → small regression delta
+         → bbox stays large → s_x stays large → (repeat)
+```
+
+The R2 hard cap (`s_x ≤ 2.5 × s_x_init`) from §20 mitigates this but does not
+eliminate it: the tracker could still be 2.5× over-scale for hundreds of frames
+before hitting the cap.
+
+### The fix
+
+Lock `s_x` (and by derivation `scale_z`) to their initial values, completely
+decoupling them from the running bbox estimate:
+
+```python
+# Fix 1 — in AdvancedTracker.track()
+s_x     = SX_LOCK_FACTOR * self._init_s_z * (INSTANCE_SIZE / EXEMPLAR_SIZE)
+scale_z = EXEMPLAR_SIZE / self._init_s_z   # always the initial scale
+```
+
+`SX_LOCK_FACTOR = 1.0` (full lock).  The model always processes the search
+patch at the same pixel scale as it saw during initialisation.  If the target
+has shrunk (moved away), it now appears proportionally smaller inside the
+fixed-size crop, and the appropriate small-anchor prediction is both available
+and not penalised.
+
+Enable / disable via `--no_fix1` flag; runs as the default when omitted.
+
+### Results on `ir_crop.mp4`
+
+#### s_x over time
+
+| Frame | Fix1 `s_x` | Adv-v2 `s_x` |
+|------:|--------:|----------:|
+| 1     | 271 | 271 |
+| 500   | **271** | 338+ |
+| 1000  | **271** | 338+ |
+| 3000  | **271** | 338+ |
+| 5900  | **271** | 338+ |
+
+Fix1 `s_x` is constant at **271 px for all 5965 frames** — the lock works
+exactly as intended.
+
+#### Score and bbox statistics
+
+| Metric | Adv-v2 (R2 cap) | Fix1 (s_x locked) | Delta |
+|--------|:--------------:|:-----------------:|:-----:|
+| Mean score | 0.466 | 0.456 | −0.009 |
+| Median score | 0.466 | 0.425 | −0.041 |
+| High (≥ 0.7) | 22.2 % | 16.0 % | −6.2 pp |
+| Mid (0.4 – 0.7) | 34.7 % | 38.9 % | +4.2 pp |
+| Low (< 0.4) | 43.0 % | 45.1 % | +2.1 pp |
+| Bbox grew > 150 % init area | **14 frames** | **0 frames** | ✓ Eliminated |
+| Bbox shrunk < 85 % init area | 4096 | 2007 | More stable |
+| Gallery adds | 46 | 48 | Similar |
+
+#### Per-segment scores
+
+| Frames | Adv-v2 | Fix1 | Delta |
+|--------|:------:|:----:|:-----:|
+| 0 – 1 000 | 0.665 | **0.679** | +2 % |
+| 1 000 – 2 000 | **0.646** | 0.485 | −25 % |
+| 2 000 – 3 000 | **0.452** | 0.425 | −6 % |
+| 3 000 – 4 000 | **0.518** | 0.467 | −10 % |
+| 4 000 – 5 000 | 0.265 | **0.346** | **+30 %** |
+| 5 000 – 6 000 | 0.241 | **0.330** | **+37 %** |
+
+### Analysis
+
+**What worked:** The positive feedback loop is fully broken.  Zero frames
+exhibit runaway bbox growth (> 150 % init area), compared with 14 in Adv-v2.
+Late-frame tracking (frames 4 000 – 6 000) improves +30 – 37 %, exactly the
+period where the old tracker had accumulated the most s_x inflation.
+
+**Trade-off (frames 1 000 – 2 000, −25 %):** Fix1 assumes `center_pos` stays
+accurate.  When the target makes a larger lateral move, the fixed-size crop may
+not fully contain it.  Adv-v2's flexible `s_x` could occasionally compensate
+by widening the search area.  This is a separate problem — **positional drift**
+— not addressed by Fix1 alone and requiring a re-detection module.
+
+**Bbox dynamics:** Fix1 produces aspect-ratio-stable boxes (width ≈ 80 – 110,
+height ≈ 33 – 55) throughout.  Adv-v2 alternates between normal (∼ 100 × 40)
+and distorted (∼ 40 × 75) shapes, indicating repeated drift-and-lock cycles
+driven by the unconstrained s_x.
+
+### Visual comparison: Fix1 vs Adv-v2 vs SAMv2.1
+
+Six frames spanning the full sequence.  **Left:** Fix1 (green box).
+**Centre:** Adv-v2 (cyan box).  **Right:** SAMv2.1 (green mask).
+
+| Frame | Fix1 score | Adv-v2 score | SAM tracked? |
+|------:|:----------:|:------------:|:------------:|
+| 100   | 0.994 | 0.999 | Yes |
+| 500   | 0.751 | 0.663 | Yes |
+| 1 000 | 0.444 | 0.717 | Yes |
+| 2 000 | 0.305 | 0.541 | Partial |
+| 4 000 | **0.353** | 0.021 | No |
+| 5 000 | **0.220** | 0.206 | No |
+
+![Frame 100](docs/fix1_vs_v2_vs_sam_f0100.jpg)
+![Frame 500](docs/fix1_vs_v2_vs_sam_f0500.jpg)
+![Frame 1000](docs/fix1_vs_v2_vs_sam_f1000.jpg)
+![Frame 2000](docs/fix1_vs_v2_vs_sam_f2000.jpg)
+![Frame 4000](docs/fix1_vs_v2_vs_sam_f4000.jpg)
+![Frame 5000](docs/fix1_vs_v2_vs_sam_f5000.jpg)
+
+### Updated tracker comparison (all variants)
+
+| Variant | Mean score | High ≥ 0.7 | BBox runaway | Late frames (4k-6k) |
+|---------|:----------:|:----------:|:------------:|:-------------------:|
+| Base R1/R2/R3 | ~0.45 | ~20 % | Frequent | Poor |
+| Adv-v2 (gallery + gap) | 0.466 | 22.2 % | 14 frames | 0.253 avg |
+| **Fix1 (s_x locked)** | 0.456 | 16.0 % | **0 frames** | **0.338 avg** |
+| SAMv2.1 | — | 41 % tracked | N/A | ~0 % tracked |
+
+### Next step
+
+Fix1 addresses the *scale* half of the drift problem.  The remaining failure
+mode is *positional*: once `center_pos` drifts away from the target,
+the locked crop no longer contains it, and no amount of scale correction helps.
+
+The highest-impact next improvement is a **re-detection module**: when score
+drops below a threshold (e.g. 0.35) for N consecutive frames, run a global
+template scan across the full frame at the initial scale to relocate the
+target and reset `center_pos`.  This is precisely what SAMv2.1 does implicitly
+via full-frame Hiera encoding — it never loses the target spatially, only loses
+it in memory quality.
 
 ## References
 
