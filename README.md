@@ -27,6 +27,7 @@ Built on [PySOT](https://github.com/STVIR/pysot). Designed to run on AWS GPU ins
 17. [Debugging the Tracker](#17-debugging-the-tracker)
 18. [Findings from Debug Analysis](#18-findings-from-debug-analysis)
 19. [Recommendations](#19-recommendations)
+20. [Advanced Tracker: Dual Template + Gallery](#20-advanced-tracker-dual-template--gallery)
 
 ---
 
@@ -1503,6 +1504,124 @@ else:
 | **Dual template** | Keep `zf_init` (frozen) + `zf_dynamic` (EMA updated). Run RPN head on both, merge scores with `w=0.6/0.4`. Prevents complete drift even if dynamic template degrades. |
 | **Template gallery** | Ring buffer of 5 high-confidence templates; each frame select the one giving highest score on current search. Handles appearance variation without drift risk. |
 | **Search scale adaptation** | Predict the likely new scale from `loc` output before expanding `s_x`; constrain `s_x` to be consistent with the predicted `dw/dh`. |
+
+---
+
+## 20. Advanced Tracker: Dual Template + Gallery
+
+Implemented in `run_video_inference_advanced.py`. Builds on the R2/R3 fixes from
+`run_video_inference_updated.py` and adds two new mechanisms.
+
+### Design
+
+**Backbone + neck run once per frame.** Only the lightweight RPN head runs
+multiple times — once per gallery slot. Runtime overhead scales with gallery
+size, not with backbone depth.
+
+#### Dual template
+
+Two template feature sets are maintained in parallel:
+
+| Template | Description |
+|----------|-------------|
+| `zf_init` | Frozen at frame 0, never modified. Provides a stable long-term anchor. |
+| `zf_dyn`  | EMA-updated (α=0.015) when conditions are met. Used when gallery is disabled. |
+
+Score blend: `score_final = 0.60 × score_init + 0.40 × score_gallery_winner`
+
+This ensures the init template always contributes 60% of the final score map,
+preventing the dynamic/gallery component from completely overriding the original
+appearance prior.
+
+#### Template gallery
+
+A ring buffer of up to 5 high-confidence template feature sets. Each frame all
+slots race through the RPN head; the slot whose penalised score peaks highest
+wins (winner-takes-all). The winner's score is blended with `zf_init` as above.
+
+**Admission conditions:**
+1. `score > 0.75` (confident tracking)
+2. `bbox_size < 1.5 × initial_size` (box hasn't grown from drift)
+3. At least 50 frames since the last admission (`GALLERY_MIN_GAP`)
+
+Condition 3 is critical — without it the ring buffer fills in burst (475 adds in
+the first 1000 frames), all slots hold near-identical drift-era templates, and
+contamination causes worse performance than the baseline.
+
+The loc (bounding-box regression) comes from whichever template — `zf_init` or
+gallery winner — scored higher at `best_idx`. This lets the gallery drive bbox
+position only when it is genuinely more confident than the init template.
+
+### Results on `ir_crop.mp4`
+
+| Metric | Updated (R1/R2/R3) | Advanced v1 (no gap) | Advanced v2 (gap=50) |
+|--------|-------------------|----------------------|----------------------|
+| Mean score | 0.503 | 0.444 | **0.466** |
+| Median score | 0.487 | 0.429 | **0.466** |
+| Frames > 0.7 | **29.1 %** | 17.7 % | 22.2 % |
+| Frames < 0.1 | **8.1 %** | 12.4 % | 13.8 % |
+| Median drift (px/f) | 6.10 | 5.23 | **4.80** |
+| Gallery additions | — | 720 | **46** |
+
+**Per-segment scores (1000-frame chunks):**
+
+| Frames | Updated | Adv v1 | **Adv v2** | Winner |
+|--------|---------|--------|------------|--------|
+| 0–1000 | 0.556 | 0.632 | **0.665** | adv-v2 +19.8% |
+| 1000–2000 | 0.470 | 0.616 | **0.645** | adv-v2 +37.2% |
+| 2000–3000 | **0.604** | 0.463 | 0.452 | updated |
+| 3000–4000 | 0.497 | 0.465 | **0.517** | adv-v2 +4% |
+| 4000–5000 | **0.604** | 0.290 | 0.265 | updated |
+| 5000–5965 | **0.280** | 0.188 | 0.241 | updated |
+
+### Key finding: gallery contamination
+
+Without the admission gap, gallery v1 added 720 templates (12% of frames).
+Once the tracker drifted around frame 2500, the gallery froze with contaminated
+templates and kept "winning" the race with wrong-location features. The init
+template won only 2.1% of frames — meaning the 60% init weight in the score
+blend was being applied to a score from the correct template, but the bbox loc
+was coming from the drift template (which scored higher at the chosen anchor).
+
+With `GALLERY_MIN_GAP=50`, additions dropped to 46 (0.8% of frames). The gallery
+now holds 5 well-separated snapshots across ~2500 frames of tracking rather than
+5 near-identical snapshots from 10 seconds of tracking.
+
+### Usage
+
+```bash
+python run_video_inference_advanced.py \
+    --cfg   pysot/experiments/siamrpn_r50_alldatasets/config.yaml \
+    --ckpt  pysot/snapshot/all_datasets/best_model.pth \
+    --video ir_crop.mp4 \
+    --init_box 339 148 391 232 \
+    --rotate -90 \
+    --out   ir_crop_advanced.mp4
+
+# Gallery only (no score blending):
+python run_video_inference_advanced.py ... --no_dual
+
+# Dual template only (EMA, no gallery):
+python run_video_inference_advanced.py ... --no_gallery
+
+# Init template only + R2/R3 (baseline):
+python run_video_inference_advanced.py ... --no_gallery --no_dual
+```
+
+**Box colour in output video:** yellow = init template driving loc;
+cyan = gallery template driving loc.
+
+### Tunable constants
+
+| Constant | Default | Effect |
+|----------|---------|--------|
+| `GALLERY_SIZE` | 5 | Ring buffer capacity |
+| `GALLERY_UPD_THRESH` | 0.75 | Admission score gate |
+| `GALLERY_MIN_GAP` | 50 | Min frames between admissions |
+| `GALLERY_MAX_SIZE_R` | 1.5 | Reject if bbox grew > this × init |
+| `DUAL_W_INIT` | 0.60 | Init template weight in blend |
+| `DUAL_W_DYN` | 0.40 | Gallery winner weight |
+| `EMA_ALPHA` | 0.015 | EMA rate for `zf_dyn` (no-gallery mode) |
 
 ---
 
