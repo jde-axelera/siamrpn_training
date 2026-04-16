@@ -322,6 +322,180 @@ everything else. Likely causes:
 
 ---
 
+## Debugging the Tracker
+
+### Debug script
+
+```bash
+cd /data/siamrpn_training
+python debug_siamrpn.py \
+    --cfg   pysot/experiments/siamrpn_r50_alldatasets/config.yaml \
+    --ckpt  pysot/snapshot/all_datasets/best_model.pth \
+    --video ir_crop.mp4 \
+    --csv   ir_crop_best_model_rot90ccw_results.csv \
+    --out   debug_best_model.pdf \
+    --init_box 339 148 391 232
+```
+
+Generates an 11-page PDF. See `debug_siamrpn.py`.
+
+### What each page shows
+
+| Page | Content |
+|------|---------|
+| 1 | Overview: score, bbox W/H, area, centre drift, rolling score volatility over all 5966 frames. Red lines mark the 8 debug frames. |
+| 2–9 | Per-frame analysis (4×3 grid) at frames 100, 750, 1650, 3250, 3900, 4050, 4800, 5100 |
+| 10 | Anchor shapes: 5 aspect ratios (0.33, 0.5, 1.0, 2.0, 3.0) visualised on 255×255 search canvas + full 25×25 centre grid |
+| 11 | Diagnosis table: per-frame metrics with colour-coded anomaly detection |
+
+**Per-frame page layout (4 rows × 3 columns):**
+
+| Row | Col 0 | Col 1 | Col 2 |
+|-----|-------|-------|-------|
+| 0 | Full rotated frame — green=bbox, yellow=search area | Template crop (127×127, frozen at frame 0) | Search crop (255×255) with decoded best bbox |
+| 1 | **CLS heatmap** — correlation response (fg prob, max over 5 anchors). Sharp peak = model localising. Diffuse = lost. Red `+` = best anchor. | Penalized score map (after scale/ratio penalty + cosine window) | Top-20 candidate bboxes ranked by penalized score |
+| 2 | **dw heatmap** — log width scale at each search location. Uniformly red = model predicts large boxes everywhere. | **dh heatmap** — same for height | W/H distribution of top-100 decoded candidates vs current state (dashed lines) |
+| 3 | Neck feature map scale-0 (layer2 backbone, mean over 256ch) | Neck scale-1 (layer3) | Neck scale-2 (layer4) |
+
+### Key debug images
+
+**Score and bbox trajectory:**
+
+![Overview](docs/debug_overview.jpg)
+
+**Frame 100 — good tracking (sharp correlation peak):**
+
+![Frame 100](docs/debug_frame_100.jpg)
+
+**Frame 750 — first score drop (diffuse correlation response):**
+
+![Frame 750](docs/debug_frame_750.jpg)
+
+**Frame 3900 — recovery (sharp peak re-emerges):**
+
+![Frame 3900](docs/debug_frame_3900.jpg)
+
+**Frame 5100 — total loss (flat response map):**
+
+![Frame 5100](docs/debug_frame_5100.jpg)
+
+**Anchor shapes and grid:**
+
+![Anchors](docs/debug_anchors.jpg)
+
+### Debug video
+
+`debug_annotated.mp4` — per-frame 3-panel video showing:
+- Left: full frame with bbox (green), search area (yellow), score bar, frame counter
+- Centre: search crop with correlation heatmap overlaid + best anchor marker
+- Right: dw/dh regression heatmaps side-by-side
+
+```bash
+python debug_video.py \
+    --cfg   pysot/experiments/siamrpn_r50_alldatasets/config.yaml \
+    --ckpt  pysot/snapshot/all_datasets/best_model.pth \
+    --video ir_crop.mp4 \
+    --out   debug_annotated.mp4 \
+    --init_box 339 148 391 232
+```
+
+---
+
+## Findings from Debug Analysis
+
+### 1 — Diffuse correlation response causes score drops
+
+The CLS heatmap (Pages 3, 4, 5 of debug PDF) shows a **flat, spatially uniform** response when score < 0.4. The model has no confident spatial peak — it cannot distinguish the target from the IR background. This happens when the search patch no longer contains the target's original appearance (drift accumulation, or abrupt target motion pushing it to the edge of the search area).
+
+### 2 — Consistently positive dw/dh drives bbox growth
+
+At **every** debug frame, the dw and dh regression maps are predominantly positive (warm colours). This means the MultiRPN head predicts `exp(dw) > 1.0` almost everywhere in the search image — systematically larger than the anchor size. After the smooth state update (`width = size*(1−lr) + pred_w*lr`), this adds a few pixels to bbox W/H every frame. Over 5966 frames this compounds to the 5.8× area growth observed.
+
+**Root cause hypothesis:** training data objects (Anti-UAV410 drones) are larger relative to the search crop than this ground vehicle target. The RPN biases toward predicting large boxes because that minimised training loss.
+
+### 3 — Search area growth is a positive feedback loop
+
+`s_x ∝ sqrt(w × h)`. As the bbox grows → s_x grows → the search crop covers more of the image → the model sees more background → correlation response degrades → score drops → bbox grows faster (low-penalty large predictions accepted). Pages 2–4 of the debug PDF show `s_x` growing from ~160 at frame 100 to >400 at frame 4000.
+
+### 4 — Neck features degrade at wrong scale
+
+When `s_x` is 3× the correct value the target occupies only ~9% of the search crop instead of the expected ~50%. The neck features (Row 3 of each debug page) show increasingly diffuse, background-dominated activations as `s_x` grows. The correlation with the (unchanged) template becomes meaningless.
+
+### 5 — Template is stale after long drift
+
+The template is frozen at frame 0. IR targets change appearance over a 4-minute sequence (altitude, aspect angle, thermal emission). By frame 3000+ the template appearance no longer matches the current target. Dynamic template update would recover this.
+
+---
+
+## Recommendations
+
+### Immediate fixes (no retraining required)
+
+#### R1 — EMA template update with size gate
+
+Update the template features slowly when tracking is confident and bbox hasn't grown too large. Implemented in `run_video_inference_updated.py`.
+
+```python
+UPDATE_THRESH  = 0.75   # score gate
+MAX_SIZE_RATIO = 1.5    # don't update if bbox > 1.5× initial
+EMA_ALPHA      = 0.015  # blend rate (very slow)
+FROZEN_S_Z     = s_z_at_init  # always crop at init scale, never inflated scale
+
+size_ratio = max(self.size[0]/init_w, self.size[1]/init_h)
+if score[best_idx] > UPDATE_THRESH and size_ratio < MAX_SIZE_RATIO:
+    new_z = get_subwindow(img, center, EXEMPLAR_SIZE, FROZEN_S_Z, avg)
+    new_zf = model.neck(model.backbone(new_z))
+    model.zf = [(1-EMA_ALPHA)*o + EMA_ALPHA*n for o, n in zip(model.zf, new_zf)]
+```
+
+**Critical:** use the frozen initial `s_z` (not the current inflated one) so the crop scale stays consistent with the template.
+
+#### R2 — Hard clamp on search area growth
+
+Cap `s_x` to `max_s_x_factor × s_z_init` to break the feedback loop:
+
+```python
+MAX_SX_FACTOR = 2.5
+s_x = min(s_x, MAX_SX_FACTOR * s_z_init)
+```
+
+#### R3 — Increase scale penalty
+
+Raise `PENALTY_K` from 0.05 to 0.15–0.20 in `config.yaml`. This more aggressively penalises RPN candidates that are very different in size from the current state, reducing the rate of bbox growth per frame.
+
+#### R4 — Score-gated bbox size update
+
+Only accept bbox size changes when score is high:
+
+```python
+SIZE_UPDATE_THRESH = 0.55
+if score[best_idx] >= SIZE_UPDATE_THRESH:
+    width  = size[0] * (1 - lr) + pred_w * lr
+    height = size[1] * (1 - lr) + pred_h * lr
+else:
+    width, height = size[0], size[1]  # freeze size, only move centre
+```
+
+### Training improvements (require retraining)
+
+| Issue | Fix |
+|-------|-----|
+| Model biased toward large bbox predictions | Add bbox area regularisation loss; balance training data by target/search area ratio |
+| Template gets stale | Add online fine-tuning samples to training (UpdateNet approach) |
+| Single-video IR data | Add more diverse IR sequences at different altitudes, speeds, backgrounds |
+| RGB-domain bias | Ensure all training data is thermal-only (Anti-UAV410 is mixed IR quality) |
+| Early stopping at epoch 123 | Train with spatial stability metric (not just cls+loc loss) as early-stop criterion |
+
+### Architecture improvements
+
+| Improvement | Description |
+|-------------|-------------|
+| **Dual template** | Keep `zf_init` (frozen) + `zf_dynamic` (EMA updated). Run RPN head on both, merge scores with `w=0.6/0.4`. Prevents complete drift even if dynamic template degrades. |
+| **Template gallery** | Ring buffer of 5 high-confidence templates; each frame select the one giving highest score on current search. Handles appearance variation without drift risk. |
+| **Search scale adaptation** | Predict the likely new scale from `loc` output before expanding `s_x`; constrain `s_x` to be consistent with the predicted `dw/dh`. |
+
+---
+
 ## References
 
 - **SiamRPN++**: Li et al., CVPR 2019 — [paper](https://arxiv.org/abs/1812.11703)
