@@ -2002,35 +2002,56 @@ BACKBONE:
 
 Before training, all 5 datasets are visualised with bounding-box overlays using
 `visualize_datasets.py`. The script samples 6 images per dataset, draws boxes
-in dataset-specific colours, and generates a 7-page PDF report:
-
-| Page | Content |
-|------|---------|
-| 1 | Cover — dataset table (names, types, sample counts) |
-| 2 | Stats — sample-distribution pie chart + bbox-size box plot |
-| 3 | HIT-UAV (red) — YOLO detection labels |
-| 4 | Anti-UAV410 (blue) — SOT tracklet frames |
-| 5 | DUT-VTUAV (green) — IR infrared sub-folder frames |
-| 6 | MassMIND (orange) — flat IR images, multi-bbox |
-| 7 | DUT-AntiUAV (purple) — anti-UAV tracking frames |
-
-Output: `dataset_samples.pdf` (4.7 MB, generated 2026-04-17).
+in dataset-specific colours, and saves individual JPGs to `docs/`.
 
 ```bash
-python visualize_datasets.py
-# → dataset_samples.pdf
+python visualize_datasets.py   # → docs/ds_*.jpg  +  dataset_samples.pdf
 ```
 
-Key observations from the visualisation:
-- **HIT-UAV**: richest labels (person/car/bicycle), multiple objects per frame,
-  moderate bbox sizes (~5–15% image area).
-- **Anti-UAV410**: single UAV target per frame, very small (~1–3% image area),
-  high contrast against sky background.
-- **DUT-VTUAV**: similar to Anti-UAV410 but noisier IR quality; some frames with
-  occlusion.
-- **MassMIND**: multiple annotations per image (crowd scenes); bboxes span a
-  wider size range.
-- **DUT-AntiUAV**: tightest bbox distribution; UAV appears at distance.
+**Overview & statistics**
+
+![Dataset cover](docs/ds_cover.jpg)
+
+![Dataset statistics](docs/ds_stats.jpg)
+
+---
+
+**HIT-UAV** — YOLO bbox labels · 5 classes (person / car / bicycle / vehicle / DontCare)
+
+![HIT-UAV samples](docs/ds_hituav.jpg)
+
+---
+
+**Anti-UAV410** — SOT sequences · UAV tracking · PySOT JSON
+
+![Anti-UAV410 samples](docs/ds_anti_uav410.jpg)
+
+---
+
+**DUT-VTUAV** — SOT sequences · IR frames under `{seq}/infrared/`
+
+![DUT-VTUAV samples](docs/ds_dut_vtuav.jpg)
+
+---
+
+**MassMIND** — Flat IR images · multiple bboxes per image
+
+![MassMIND samples](docs/ds_massmind.jpg)
+
+---
+
+**DUT-AntiUAV** — Anti-UAV tracking · 5-digit frame IDs
+
+![DUT-AntiUAV samples](docs/ds_dut_anti_uav.jpg)
+
+---
+
+Key observations:
+- **HIT-UAV**: richest labels, multiple objects per frame, bbox ~5–15% image area.
+- **Anti-UAV410**: single UAV, very small target (~1–3%), high sky contrast.
+- **DUT-VTUAV**: similar to Anti-UAV410, noisier IR quality, some occlusion.
+- **MassMIND**: crowd scenes, multi-bbox, wider size range.
+- **DUT-AntiUAV**: tightest bbox distribution, UAV at distance.
 
 ### Feature heatmap visualisation
 
