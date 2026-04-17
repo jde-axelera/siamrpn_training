@@ -30,6 +30,7 @@ Built on [PySOT](https://github.com/STVIR/pysot). Designed to run on AWS GPU ins
 20. [Advanced Tracker: Dual Template + Gallery](#20-advanced-tracker-dual-template--gallery)
 21. [SAM-Based Video Segmentation](#21-sam-based-video-segmentation)
 22. [Fix 1: Decoupling Search-Area Size from Bounding Box](#22-fix-1-decoupling-search-area-size-from-bounding-box)
+23. [Stage 1: IR Backbone Fine-tuning](#23-stage-1-ir-backbone-fine-tuning)
 
 ---
 
@@ -1913,6 +1914,116 @@ template scan across the full frame at the initial scale to relocate the
 target and reset `center_pos`.  This is precisely what SAMv2.1 does implicitly
 via full-frame Hiera encoding — it never loses the target spatially, only loses
 it in memory quality.
+
+---
+
+## 23. Stage 1: IR Backbone Fine-tuning
+
+### Motivation
+
+SiamRPN++'s ResNet-50 backbone is pre-trained on ImageNet (RGB, daytime, natural
+scenes). IR thermal imagery has fundamentally different statistics: high-contrast
+thermal gradients, no colour, inverted brightness (hot objects are bright), and
+small target sizes (~40x35 px at altitude). The domain gap degrades feature
+quality, which in turn makes the cross-correlation in the neck less discriminative.
+
+The fix is to fine-tune the backbone as a **binary detector** (object vs.
+background) on all available IR data before running SiamRPN++ neck+RPN training.
+This is Stage 1 of a two-stage training pipeline.
+
+### Architecture
+
+```
+Input IR frame
+    |
+    v
+ResNet-50 backbone  ---- Stage 1 fine-tune (this section)
+    |
+    v
+FasterRCNN FPN + RPN + head  (detection loss, 2 classes: bg / object)
+```
+
+The FPN, RPN, and detection head are **discarded** after Stage 1. Only the
+backbone weights are saved and used to initialise Stage 2 SiamRPN++ training.
+
+### Data (31 565 samples, stride 10 over sequences)
+
+| Dataset | Type | Samples | Notes |
+|---------|------|--------:|-------|
+| HIT-UAV | IR detection (YOLO) | 2 866 | person/car/bicycle/vehicle |
+| Anti-UAV410 | IR SOT sequences | 20 921 | UAV tracking |
+| DUT-VTUAV | IR channel of dual-modal | 5 368 | infrared sub-folder |
+| MassMIND | IR images | 181 | flat image structure |
+| DUT-AntiUAV | IR tracking (Anti-UAV-V0) | 2 229 | 5-digit frame IDs |
+| **Total** | | **31 565** | 90% train / 10% val |
+
+All labels are collapsed to a single **object** class. Cross-dataset label
+harmonisation is not needed; the backbone only needs to learn IR
+object-vs-background discrimination.
+
+### Training schedule
+
+| Phase | Epochs | Trainable layers | LR |
+|-------|--------|------------------|----|
+| 1 -- warmup | 1 - 5 | FPN + RPN + head only (backbone frozen) | 1e-3 |
+| 2 -- partial unfreeze | 6 - 20 | layer3, layer4 + FPN/RPN/head | 5e-4 |
+| 3 -- full unfreeze | 21 - 30 | all layers | 1e-4 |
+
+Optimiser: SGD momentum=0.9 weight_decay=1e-4 with cosine annealing per phase.
+DataParallel across 4 x Tesla T4 (16 GB each).
+
+### Backbone weight loading note
+
+PySOT's `sot_resnet50.pth` uses **3x3 conv** in downsample projections
+(layers 2-4), while torchvision ResNet-50 uses 1x1. Shape-mismatched layers
+(6 downsample convolutions) are kept at torchvision defaults; all other layers
+(conv1/bn1/layer1-4 feature convolutions) are loaded from `sot_resnet50.pth`.
+
+### Script
+
+```bash
+python train_ir_backbone.py \
+    --data_root  /data/siamrpn_training/data \
+    --pretrained /data/siamrpn_training/pretrained/sot_resnet50.pth \
+    --out        /data/siamrpn_training/pretrained/ir_backbone.pth \
+    --epochs 30 --batch 4 --workers 6 --sample_stride 10
+```
+
+Output: `pretrained/ir_backbone.pth` -- backbone-only state dict, drop-in
+replacement for `sot_resnet50.pth` in Stage 2 SiamRPN++ config:
+
+```yaml
+BACKBONE:
+  PRETRAINED: /data/siamrpn_training/pretrained/ir_backbone.pth
+```
+
+### Feature heatmap visualisation
+
+After training, backbone activations are visualised as heatmaps on `ir_crop.mp4`
+(-90 degrees rotation) using `visualize_backbone_heatmap.py`. The script extracts
+layer4 mean-channel activations, resizes them to frame resolution, and overlays
+as a jet-colourmap heatmap. Side-by-side comparison:
+
+- **Left**: original `sot_resnet50.pth` (ImageNet/RGB pre-training)
+- **Right**: `ir_backbone.pth` (IR fine-tuned)
+
+Key frames are saved to `docs/heatmap_comparison_f*.jpg` and the full annotated
+video to `ir_crop_heatmap.mp4`.
+
+```bash
+python visualize_backbone_heatmap.py \
+    --video     ir_crop.mp4 \
+    --original  pretrained/sot_resnet50.pth \
+    --finetuned pretrained/ir_backbone.pth \
+    --rotate   -90 \
+    --out       ir_crop_heatmap.mp4
+```
+
+### Status
+
+**Training in progress** (2026-04-17). Results, loss curves, and heatmap
+comparisons will be added here upon completion.
+
 
 ## References
 
