@@ -1970,7 +1970,7 @@ object-vs-background discrimination.
 | 3 -- full unfreeze | 21 - 30 | all layers | 1e-4 |
 
 Optimiser: SGD momentum=0.9 weight_decay=1e-4 with cosine annealing per phase.
-DataParallel across 4 x Tesla T4 (16 GB each).
+DistributedDataParallel (`torchrun --nproc_per_node=4`, 4 x Tesla T4 16 GB each).
 
 ### Backbone weight loading note
 
@@ -1986,7 +1986,7 @@ python train_ir_backbone.py \
     --data_root  /data/siamrpn_training/data \
     --pretrained /data/siamrpn_training/pretrained/sot_resnet50.pth \
     --out        /data/siamrpn_training/pretrained/ir_backbone.pth \
-    --epochs 30 --batch 4 --workers 6 --sample_stride 10
+    --epochs 30 --batch 4 --workers 4 --sample_stride 10
 ```
 
 Output: `pretrained/ir_backbone.pth` -- backbone-only state dict, drop-in
@@ -1996,6 +1996,41 @@ replacement for `sot_resnet50.pth` in Stage 2 SiamRPN++ config:
 BACKBONE:
   PRETRAINED: /data/siamrpn_training/pretrained/ir_backbone.pth
 ```
+
+
+### Dataset visualisation
+
+Before training, all 5 datasets are visualised with bounding-box overlays using
+`visualize_datasets.py`. The script samples 6 images per dataset, draws boxes
+in dataset-specific colours, and generates a 7-page PDF report:
+
+| Page | Content |
+|------|---------|
+| 1 | Cover — dataset table (names, types, sample counts) |
+| 2 | Stats — sample-distribution pie chart + bbox-size box plot |
+| 3 | HIT-UAV (red) — YOLO detection labels |
+| 4 | Anti-UAV410 (blue) — SOT tracklet frames |
+| 5 | DUT-VTUAV (green) — IR infrared sub-folder frames |
+| 6 | MassMIND (orange) — flat IR images, multi-bbox |
+| 7 | DUT-AntiUAV (purple) — anti-UAV tracking frames |
+
+Output: `dataset_samples.pdf` (4.7 MB, generated 2026-04-17).
+
+```bash
+python visualize_datasets.py
+# → dataset_samples.pdf
+```
+
+Key observations from the visualisation:
+- **HIT-UAV**: richest labels (person/car/bicycle), multiple objects per frame,
+  moderate bbox sizes (~5–15% image area).
+- **Anti-UAV410**: single UAV target per frame, very small (~1–3% image area),
+  high contrast against sky background.
+- **DUT-VTUAV**: similar to Anti-UAV410 but noisier IR quality; some frames with
+  occlusion.
+- **MassMIND**: multiple annotations per image (crowd scenes); bboxes span a
+  wider size range.
+- **DUT-AntiUAV**: tightest bbox distribution; UAV appears at distance.
 
 ### Feature heatmap visualisation
 
@@ -2021,8 +2056,20 @@ python visualize_backbone_heatmap.py \
 
 ### Status
 
-**Training in progress** (2026-04-17). Results, loss curves, and heatmap
-comparisons will be added here upon completion.
+**Training in progress** (2026-04-17) — epoch 15/30, Phase 2 (layer3+4 unfrozen).
+
+| Epoch | train_loss | val_loss | LR | Notes |
+|------:|-----------:|---------:|----|-------|
+| 5 | — | — | 1.00e-03 | Phase 1 complete (head-only warmup) |
+| 6 | 0.0805 | 0.0787 | 5.00e-04 | Phase 2 start; best ckpt saved |
+| 11 | 0.0787 | 0.0790 | 2.53e-04 | Cosine LR decay |
+| 12 | 0.0783 | 0.0760 | 1.76e-04 | **New best val_loss** |
+
+- Best `val_loss = 0.0760` → `pretrained/ir_backbone.pth` (94.3 MB)
+- Phase 3 (full unfreeze, all layers, lr=1e-4) begins at epoch 21
+- ETA: ~2 hours remaining
+
+Heatmap comparison and final loss curves will be added upon completion.
 
 
 ## References
