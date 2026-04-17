@@ -2156,3 +2156,198 @@ Full annotated video: `ir_crop_heatmap.mp4` (111 MB).
 - **MassMIND**: [github.com/uml-marine-robotics/MassMIND](https://github.com/uml-marine-robotics/MassMIND)
 - **MVSS-Baseline**: [github.com/jiwei0921/MVSS-Baseline](https://github.com/jiwei0921/MVSS-Baseline)
 - **Axelera Voyager SDK**: [axelera.ai](https://www.axelera.ai)
+
+
+---
+
+## 24. Stage 2: 3-Stage IR Backbone Training Pipeline
+
+### Motivation
+
+The Stage 1 binary FasterRCNN backbone (`ir_backbone.pth`) taught the network to
+distinguish IR foreground from background but has two remaining weaknesses:
+
+1. **No class discrimination** — car, person, bicycle, vehicle all map to the same
+   feature pattern. SiamRPN++ cross-correlation needs class-specific features to
+   avoid template drift onto similar thermal blobs.
+
+2. **Wrong training objective** — detection loss asks "is there an object here?"
+   SiamRPN++ actually needs "does this patch look like my template?" — a
+   similarity/matching objective, not a classification objective.
+
+The 3-stage pipeline addresses both.
+
+---
+
+### Dataset Audit — IR vs RGB Verification
+
+All images were checked by measuring mean inter-channel pixel difference.
+Grayscale-stored-as-RGB images (IR sensor output) have diff ≈ 0.
+True RGB images are excluded.
+
+| Dataset | Images | Mean channel diff | Verdict |
+|---------|-------:|:-----------------:|---------|
+| hit\_uav | 2,866 | 0.0 | ✅ IR — used Stages 0, 1 |
+| anti\_uav410 | 438,397 | 3.0 | ✅ IR (JPEG artifacts) — Stage 0 only |
+| dut\_vtuav / **infrared** | 596,348 | 0.0 | ✅ IR — Stages 0, 2 |
+| dut\_vtuav / **rgb** | 622,230 | 14.1 | ❌ RGB — **excluded** |
+| massmind | 2,916 | 0.0 | ✅ IR — Stage 0 |
+| msrs / ir | 1,083 | 0.0 | ✅ IR — Stage 0 |
+| dut\_anti\_uav | 24,804 | 23.8 | ❌ RGB — **excluded** |
+
+**Total usable IR: ~1.04 M images**
+
+---
+
+### Stage 0 — SimCLR Self-Supervised Pre-training
+
+**Script:** `train_stage0_simclr.py`
+**Launch:** `torchrun --nproc_per_node=4 --master_port=29500 train_stage0_simclr.py`
+**Output:** `pretrained/ir_simclr_backbone.pth`
+
+Removes the ImageNet/RGB bias from the backbone by learning IR-domain features
+without any labels. Given two randomly augmented crops of the same IR frame,
+the projection head must produce similar embeddings (NT-Xent / InfoNCE loss).
+
+**Datasets:** all 5 IR sources (~1.04 M images)
+
+**IR-appropriate augmentations** (no colour jitter — images are grayscale):
+- Random resized crop (scale 0.2–1.0)
+- Random horizontal flip
+- Gaussian blur (σ 0.5–2.0, emissivity smearing)
+- Brightness jitter ±15% (thermal offset)
+- Additive Gaussian noise (sensor noise)
+
+**Hyperparameters:**
+
+| Parameter | Value |
+|-----------|-------|
+| Backbone | ResNet-50 (no FC) |
+| Projection head | FC(2048→512→128) + BN |
+| Loss | NT-Xent, temperature=0.07 |
+| Optimiser | SGD, momentum=0.9, wd=1e-4 |
+| LR | 0.3 × batch/256, cosine decay |
+| Batch (per GPU) | 64 |
+| Epochs | 100 |
+| Precision | AMP (fp16) |
+
+**Status:** `TODO`
+
+---
+
+### Stage 1 — Multi-class Detection Fine-tuning
+
+**Script:** `train_stage1_detection.py`
+**Launch:** `torchrun --nproc_per_node=4 --master_port=29501 train_stage1_detection.py`
+**Output:** `pretrained/ir_detector_backbone.pth`
+
+Replaces the binary (bg/fg) Stage 1 training with a **4-class** detector so the
+backbone learns class-discriminative IR features. Initialises from Stage 0
+SimCLR weights (or `sot_resnet50.pth` if Stage 0 not yet run).
+
+**Dataset:** HIT-UAV only — the only IR dataset with per-class road-object labels.
+
+| YOLO id | Class | Detector label |
+|---------|-------|----------------|
+| 0 | person | 1 |
+| 1 | car | 2 |
+| 2 | bicycle | 3 |
+| 3 | vehicle | 4 |
+| 4 | DontCare | skipped |
+
+**Training phases** (same schedule as Stage 1 binary training):
+
+| Phase | Epochs | Frozen | LR |
+|-------|--------|--------|----|
+| 1 — warmup | 1–5 | full backbone | 1e-3 |
+| 2 — partial | 6–20 | stem+layer1+layer2 | 5e-4 |
+| 3 — full | 21–30 | nothing | 1e-4 |
+
+**Status:** `TODO`
+
+---
+
+### Stage 2 — Siamese Tracking Fine-tuning
+
+**Script:** `train_stage2_siamese.py`
+**Launch:** `torchrun --nproc_per_node=4 --master_port=29502 train_stage2_siamese.py`
+**Output:** `pretrained/ir_siamese_backbone.pth`
+
+Aligns backbone training with SiamRPN++ inference: given a template crop
+(frame *t*) and a search crop (frame *t*+δ, same object), the backbone should
+produce features where `sim(template, search_target) ≫ sim(template, other_sequence)`.
+
+**Loss:** Per-layer InfoNCE (NT-Xent) at L2, L3, L4 simultaneously.
+- Template features → global average pool → L2-normalised vector
+- Search features → centre-region pool → L2-normalised vector
+- NT-Xent: template[i] must match search[i], all other B−1 pairs are negatives
+- Total loss = mean of L2 + L3 + L4 InfoNCE
+
+Why centre-pooling for search: search crop (255×255) is centred on the target
+with small jitter (≤20% of bbox size), so the centre region of the feature map
+reliably contains the target.
+
+**Dataset:** DUT-VTUAV infrared sequences (road objects only, RGB excluded)
+
+| Category | Sequences |
+|----------|----------:|
+| pedestrian | 100 |
+| car | 70 |
+| bus | 16 |
+| tricycle | 12 |
+| e-bike | 10 |
+| truck | 5 |
+| other | 12 |
+| **Total** | **225** |
+
+596,348 IR frames · max frame gap δ ≤ 50 · virtual epoch = 225,000 pairs
+
+**Hyperparameters:**
+
+| Parameter | Value |
+|-----------|-------|
+| Template size | 127×127 |
+| Search size | 255×255 |
+| Loss | NT-Xent per layer, temperature=0.07 |
+| Optimiser | AdamW, wd=1e-4 |
+| LR | 1e-4 cosine → 1e-5 |
+| Batch (per GPU) | 32 |
+| Epochs | 20 |
+| Precision | AMP (fp16) |
+
+**Status:** `TODO`
+
+---
+
+### Checkpoint chain
+
+```
+ImageNet init  (sot_resnet50.pth)
+       ↓
+Stage 0 SimCLR  →  ir_simclr_backbone.pth      (1.04M IR frames, no labels)
+       ↓
+Stage 1 Detect  →  ir_detector_backbone.pth    (HIT-UAV 4-class, 2,866 images)
+       ↓
+Stage 2 Siamese →  ir_siamese_backbone.pth     (DUT-VTUAV 596K IR frames)
+       ↓
+ Drop into SiamRPN++ in place of original backbone
+```
+
+### Running all stages sequentially
+
+```bash
+# Stage 0 (~11 h on 4×T4)
+torchrun --nproc_per_node=4 --master_port=29500 train_stage0_simclr.py \
+    --epochs 100 --batch 64
+
+# Stage 1 (~20 min on 4×T4)
+torchrun --nproc_per_node=4 --master_port=29501 train_stage1_detection.py \
+    --epochs 30 --batch 4
+
+# Stage 2 (~3 h on 4×T4)
+torchrun --nproc_per_node=4 --master_port=29502 train_stage2_siamese.py \
+    --epochs 20 --batch 32
+```
+
+All scripts support `--resume` via automatic checkpoint detection and log to
+`stage{0,1,2}_*.log`.
