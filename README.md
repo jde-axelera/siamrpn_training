@@ -31,6 +31,9 @@ Built on [PySOT](https://github.com/STVIR/pysot). Designed to run on AWS GPU ins
 21. [SAM-Based Video Segmentation](#21-sam-based-video-segmentation)
 22. [Fix 1: Decoupling Search-Area Size from Bounding Box](#22-fix-1-decoupling-search-area-size-from-bounding-box)
 23. [Stage 1: IR Backbone Fine-tuning](#23-stage-1-ir-backbone-fine-tuning)
+24. [Tracker Failure Analysis — ir_crop.mp4](#24-tracker-failure-analysis--ir_cropmp4)
+25. [Small-Object Tracker Training — Scale-Drop Approach](#25-small-object-tracker-training--scale-drop-approach)
+26. [Stage 2: 3-Stage IR Backbone Training Pipeline](#26-stage-2-3-stage-ir-backbone-training-pipeline)
 
 ---
 
@@ -2145,6 +2148,117 @@ activations are suppressed compared to the original backbone.
 Full annotated video: `ir_crop_heatmap.mp4` (111 MB).
 
 
+## 24. Tracker Failure Analysis — ir_crop.mp4
+
+### Observed failure
+
+Video: aircraft landing approach on a runway. Target: ground vehicle (car) visible at the start.
+
+| Frame | Event | SiamRPN++ (default) | SiamRPN++ (IR Siamese) |
+|-------|-------|--------------------|-----------------------|
+| 0 | Target init | Car clearly visible ~50×40 px | same |
+| 3696 | **Default fails** | Drifts to runway threshold bars | Still tracking (score 0.94) |
+| 4726 | **IR Siamese fails** | Tracking runway markings | Drifts to centerline dash |
+| 5000+ | Partial recovery | Score 0.21 | Score 0.66–0.86 (intermittent) |
+
+Per-500-frame mean scores:
+
+| Frames | Default | IR Siamese |
+|--------|---------|------------|
+| 0–500 | 0.963 | 0.980 |
+| 2000–2500 | 0.854 | 0.928 |
+| 3750–4000 | 0.369 | 0.886 |
+| 4000–4250 | 0.137 | 0.893 |
+| 4750–5000 | 0.287 | 0.138 |
+| 5500–5750 | 0.048 | 0.834 |
+
+**IR Siamese backbone delays failure by ~1030 frames** and partially recovers.
+
+### Root cause
+
+1. **Extreme scale shrinkage**: as the aircraft approaches, the car shrinks from ~50 px to 2–3 px over 5000 frames
+2. **Feature resolution too coarse**: Layer4 (stride 32) — a 5 px target becomes 0.16 feature pixels, completely invisible
+3. **Structured background distractors**: runway threshold bars, painted numbers, and centerline dashes produce *stronger* Layer4 correlation response than the sub-pixel car
+4. **Template lock on distractor**: once the tracker latches onto a runway marking it stays there — SiamRPN++ has no re-detection
+
+Evidence from multi-layer heatmaps (`ir_failure_heatmap_analysis.pdf`):
+- At frame 0 (large target): both L2/L3/L4 activate tightly on the car
+- At frame 3700 (default fails): L4 activates on the entire runway surface; L2/L3 still show weak car response
+- At frame 4000: both backbones activate on runway number "12" region — the distractor dominates
+
+---
+
+## 25. Small-Object Tracker Training — Scale-Drop Approach
+
+### Problem statement
+
+Standard SiamRPN++ training pairs have templates and search frames at comparable scales. This never teaches the model to correlate a large-target template with a tiny-target search frame. That exact scenario arises in any airborne camera tracking a ground vehicle from altitude.
+
+### Proposed method: Scale-Drop Siamese
+
+**Three changes to the training pipeline:**
+
+**1. Scale-Drop Augmentation (ScaleDropWrapper)**
+
+For 40% of training pairs, the search crop is expanded by factor `1/sf` (sf ∈ [0.25, 0.80]) and resized back to 255 px. This makes the target appear `sf×` smaller in the search frame while the template remains unchanged.
+
+```
+Normal pair:    [template: 50px car] ↔ [search: 50px car at center]
+Scale-drop pair:[template: 50px car] ↔ [search: 12–40px car at center]
+```
+
+Effect: the network learns to produce a sharp correlation peak even when the search target is a fraction of the template size.
+
+**2. Size-Weighted Classification Loss**
+
+```python
+size_weight = clamp(ref_area / target_area, 1.0, 5.0)   # ref_area = 32×32 px
+```
+
+Training examples with tiny targets get up to 5× higher gradient. This prevents the model from ignoring small-target pairs because they contribute little to the standard BCE loss.
+
+**3. DIoU Regression Loss**
+
+Adds Distance-IoU term on top of the existing smooth-L1 regression loss. DIoU includes centre-distance penalty, which forces better localisation for sub-pixel-sized bounding boxes where IoU alone is degenerate.
+
+### Tracker config changes for small objects
+
+| Parameter | Old | New | Reason |
+|-----------|-----|-----|--------|
+| `PENALTY_K` | 0.05 | 0.01 | Less scale-change penalty — allow the target to shrink |
+| `WINDOW_INFLUENCE` | 0.42 | 0.25 | Less cosine window — follow the target off-centre |
+| `LR` | 0.38 | 0.25 | Slower template update — resist corruption by distractors |
+| `CONTEXT_AMOUNT` | 0.5 | 0.3 | Tighter crop = better SNR when target is tiny |
+
+### Files
+
+| File | Description |
+|------|-------------|
+| `train_smallobj.py` | Modified training script with ScaleDropWrapper, size_weighted_cls_loss, diou_loss |
+| `pysot/experiments/siamrpn_r50_alldatasets/config_smallobj.yaml` | Small-object tracker config |
+| `pysot/snapshot/smallobj/` | Checkpoints for this training run |
+| `pysot/logs/smallobj/` | Training logs |
+| `ir_failure_heatmap_analysis.pdf` | Multi-layer heatmap analysis at failure frames |
+| `tracker_comparison.mp4` | Side-by-side tracking: default vs IR Siamese backbone |
+| `tracker_comparison_scores.csv` | Per-frame tracking scores for both models |
+
+### Training
+
+Resumed from epoch 103 IR Siamese checkpoint (val=0.4904), running 200 epochs with scale-drop:
+
+```bash
+torchrun --nproc_per_node=4 --master_port=29500 train_smallobj.py \
+    --cfg pysot/experiments/siamrpn_r50_alldatasets/config_smallobj.yaml \
+    --resume pysot/snapshot/all_datasets_ir_siamese/best_model.pth
+```
+
+### Status
+
+**Training in progress** (2026-04-19). Scale-drop training started at epoch 104 from IR Siamese best checkpoint.
+
+---
+
+
 ## References
 
 
@@ -2160,7 +2274,7 @@ Full annotated video: `ir_crop_heatmap.mp4` (111 MB).
 
 ---
 
-## 24. Stage 2: 3-Stage IR Backbone Training Pipeline
+## 26. Stage 2: 3-Stage IR Backbone Training Pipeline
 
 ### Motivation
 
