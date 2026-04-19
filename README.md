@@ -2234,27 +2234,46 @@ Adds Distance-IoU term on top of the existing smooth-L1 regression loss. DIoU in
 
 | File | Description |
 |------|-------------|
-| `train_smallobj.py` | Modified training script with ScaleDropWrapper, size_weighted_cls_loss, diou_loss |
-| `pysot/experiments/siamrpn_r50_alldatasets/config_smallobj.yaml` | Small-object tracker config |
-| `pysot/snapshot/smallobj/` | Checkpoints for this training run |
-| `pysot/logs/smallobj/` | Training logs |
+| `train_smallobj.py` | Training script with ScaleDropWrapper, size_weighted_cls_loss, diou_loss |
+| `pysot/experiments/siamrpn_r50_alldatasets/config_smallobj.yaml` | v1 config (cancelled) |
+| `pysot/experiments/siamrpn_r50_alldatasets/config_smallobj_v2.yaml` | v2 config — LOC_WEIGHT=2.5, CLS_WEIGHT=0.5 |
+| `pysot/snapshot/smallobj_v2/` | Checkpoints for v2 training |
+| `pysot/logs/smallobj_v2/train_v2.log` | v2 training log |
 | `ir_failure_heatmap_analysis.pdf` | Multi-layer heatmap analysis at failure frames |
 | `tracker_comparison.mp4` | Side-by-side tracking: default vs IR Siamese backbone |
 | `tracker_comparison_scores.csv` | Per-frame tracking scores for both models |
 
-### Training
+### v1 Training — Cancelled (bug: scale-drop disabled)
 
-Resumed from epoch 103 IR Siamese checkpoint (val=0.4904), running 200 epochs with scale-drop:
+v1 resumed from epoch 103 IR Siamese checkpoint (val=0.4904) and ran to epoch 106 before being cancelled.
+
+**Root cause**: `getattr(cfg.DATASET, 'SCALE_DROP_PROB', 0.0)` — default was 0.0 because SCALE_DROP_PROB
+was removed from YAML (to avoid YACS KeyError) but the code fallback was wrong. Scale-drop augmentation
+was silently disabled for the entire v1 run — the core innovation never fired.
+
+### v2 Training — Fresh from scratch (2026-04-19)
+
+**Changes from v1:**
+
+| Parameter | v1 | v2 | Reason |
+|-----------|----|----|--------|
+| SCALE_DROP_PROB default | **0.0 (bug!)** | **0.60** | Fix: scale-drop now actually runs |
+| SCALE_DROP_MIN default | 0.30 | **0.15** | Sample more extreme shrinkage (15–80%) |
+| CLS_WEIGHT | 1.0 | **0.5** | Reduce classification dominance |
+| LOC_WEIGHT | 1.2 | **2.5** | Focus gradient on localization |
+| Init | Resume ep103 checkpoint | **`--pretrained ir_siamese_backbone.pth`** | Fresh neck+RPN, backbone from IR Siamese |
+| Config | config_smallobj.yaml | **config_smallobj_v2.yaml** | New dirs: smallobj_v2/ |
 
 ```bash
-torchrun --nproc_per_node=4 --master_port=29500 train_smallobj.py \
-    --cfg pysot/experiments/siamrpn_r50_alldatasets/config_smallobj.yaml \
-    --resume pysot/snapshot/all_datasets_ir_siamese/best_model.pth
+torchrun --nproc_per_node=4 --master_port=29501 train_smallobj.py \
+    --cfg pysot/experiments/siamrpn_r50_alldatasets/config_smallobj_v2.yaml \
+    --pretrained pretrained/ir_siamese_backbone.pth
 ```
 
 ### Status
 
-**Training in progress** (2026-04-19). Scale-drop training started at epoch 104 from IR Siamese best checkpoint.
+**v2 Training in progress** (started 2026-04-19 13:52 UTC). Epoch 1 confirmed running.
+Scale-drop active at 60% of batches, target shrinkage 15–80%. Localization loss weighted 5× vs classification.
 
 ---
 
