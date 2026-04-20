@@ -95,6 +95,21 @@ All changes applied to `config_ir_siamese.yaml` for tiny IR target tracking (2�
 - **SCALE 0.18→0.50 on search**: Target ranges 2–20px across the video (100× area change). A ±18% crop scale covers only a 0.8–1.2× linear factor per frame pair; ±50% covers the realistic inter-frame scale variation over a 50-frame gap.
 - **Template scale capped at 0.10**: The template is the fixed reference — aggressive jitter corrupts the cross-correlation anchor. 0.10 covers annotation imprecision without distorting appearance.
 
+### Augmentation Samples
+
+Each row: **Template original | Template augmented | Search original | Search augmented**.
+Green box = ground-truth bbox. Orange/blue box = augmented bbox after shift+scale.
+
+**Anti-UAV 410** (8–27px targets, aerial IR UAV):
+
+![Anti-UAV 410 augmentation samples](docs/augmentation/aug_Anti_UAV_410.png)
+
+**DUT-VTUAV** (18–766px targets, aerial IR ground vehicles and pedestrians):
+
+![DUT-VTUAV augmentation samples](docs/augmentation/aug_DUT_VTUAV.png)
+
+Full PDF with all samples: [`docs/augmentation/augmentation_samples.pdf`](docs/augmentation/augmentation_samples.pdf)
+
 ---
 
 ## Notes
