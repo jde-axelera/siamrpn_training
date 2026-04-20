@@ -34,6 +34,7 @@ Built on [PySOT](https://github.com/STVIR/pysot). Designed to run on AWS GPU ins
 24. [Tracker Failure Analysis — ir_crop.mp4](#24-tracker-failure-analysis--ir_cropmp4)
 25. [Small-Object Tracker Training — Scale-Drop Approach](#25-small-object-tracker-training--scale-drop-approach)
 26. [Stage 2: 3-Stage IR Backbone Training Pipeline](#26-stage-2-3-stage-ir-backbone-training-pipeline)
+27. [ONNX Export, Validation \& Tracking Failure Analysis](#27-onnx-export-validation--tracking-failure-analysis)
 
 ---
 
@@ -2272,10 +2273,125 @@ torchrun --nproc_per_node=4 --master_port=29501 train_smallobj.py \
 
 ### Status
 
-**v2 Training in progress** (started 2026-04-19 13:52 UTC). Epoch 1 confirmed running.
-Scale-drop active at 60% of batches, target shrinkage 15–80%. Localization loss weighted 5× vs classification.
+**v2 Training — Complete (2026-04-20)**
+
+Ran 500 epochs to completion. Best validation loss: **1.0441** (saved at ).
+
+| Model | Mean score | Median | >0.5 frames / 5965 |
+|---|---|---|---|
+| Default (ImageNet) | 0.664 | 0.948 | 4011 |
+| IR Siamese (best) | **0.836** | **0.959** | **5138** |
+| v2 Scale-Drop 500ep | 0.439 | 0.371 | 2416 |
+
+**v2 performed worse than both baselines.** Root cause: 60% scale-drop + LOC_WEIGHT=2.5 over-specialised
+for tiny targets at the cost of normal-scale tracking. The model regressed on standard-size targets
+(frame 500: v2=0.725 vs default=0.934) without recovering the small-object benefit.
 
 ---
+
+
+
+## 27. ONNX Export, Validation & Tracking Failure Analysis
+
+### ONNX Export
+
+Both models exported to two-graph ONNX format (opset 17) using :
+
+| File | Input | Output |
+|------|-------|--------|
+|  |  |  each  |
+|  |  | ,  |
+|  | same | same |
+|  | same | same |
+
+### ONNX Validation — IR Siamese
+
+Raw output comparison (, monkey-patch approach):
+
+-  diff: max=0.000013, mean=0.0000033 — float32 noise only
+-  diff: max=0.000001, mean=0.00000014
+- Full tracking loop score diff: mean=**0.044** (float32 accumulation over 5966 frames)
+
+The monkey-patch approach replaces  and  with ONNX
+inference while keeping all PySOT post-processing (anchor decoding, cosine window,
+bbox smoothing) identical. This eliminates post-processing divergence.
+
+### Default vs IR Siamese ONNX Comparison
+
+Script: 
+
+| Model | Mean score | Median | >0.5 frames / 5965 |
+|---|---|---|---|
+| Default (ImageNet, ONNX) | 0.654 | 0.914 | 3990 |
+| **IR Siamese (ONNX)** | **0.833** | **0.964** | **5112** |
+| Delta (IR − Default) | +0.179 | | +1122 frames |
+
+Output: 
+
+### 5-Panel Comparison Video
+
+Script:  — composites all signals into one 2527×402 video:
+
+1. SAM2 segmentation (portrait→landscape)
+2. Default SiamRPN++ (ONNX, with bbox)
+3. IR SiamRPN++ (ONNX, with bbox)
+4. Default backbone heatmap (layer4 activations, portrait→landscape)
+5. IR fine-tuned backbone heatmap
+
+Output: 
+
+### Tracking Failure Root Cause Analysis
+
+Script:  — runs IR ONNX tracker, saves per-frame diagnostics
+(search crop, fg score heatmap, tracker state) for probe frames around failure zones.
+Full analysis video:  (4 panels × 5966 frames, 1400×400).
+
+**Panel layout per frame:**
+- Original frame + green tracker bbox + blue search crop boundary
+- Search crop (what the tracker sees, denormalised)
+- fg score heatmap overlay: yellow circle = best raw correlation, red circle = best after cosine window
+- SAM2 segmentation (for ground-truth reference)
+
+**Three confirmed failure modes:**
+
+#### Failure 1 — Genuine scale collapse (frames ~3000)
+
+Target shrinks to ~23×47 px at 640×480. SAM2 also loses confidence ( at frame 3010),
+confirming this is a real detection floor, not a post-processing issue. The backbone heatmap activates
+correctly but the correlation SNR collapses at sub-pixel feature resolution (stride-32 Layer4).
+
+#### Failure 2 — Frame boundary padding (frames ~4480+)
+
+ in a 480 px frame with  → search crop extends **49 px below frame bottom**
+(~36% padding with mean colour). SAM2  confirms target genuinely near-invisible.
+The padding breaks the correlation; all scores collapse ().
+
+Key indicator:  shown in analysis video info bar.
+
+#### Failure 3 — False target latching (frames ~5040+)
+
+A large ground vehicle enters the frame. SAM2 shifts to track it (, bright green
+mask). SiamRPN++ also latches onto it ( for the lost UAV). This is a consequence
+of Failure 2 — fixing the boundary handling prevents the drift that exposes the tracker to the distractor.
+
+#### Cosine window overcorrection (contributing factor)
+
+At frame 3060: best raw fg at grid  (left edge), after  window: 
+— **7 cells shifted**. When the target drifts to the edge of the search crop, the window biases the
+selection toward centre, reinforcing the drift. This is highlighted in red in 
+whenever .
+
+**Note:** this is a contributing factor, not the primary cause. The primary cause is genuine scale
+collapse confirmed by SAM2.
+
+#### Recommended fixes
+
+| Issue | Fix |
+|---|---|
+| Scale collapse | Re-detection module: when , run full-frame backbone search |
+| Frame boundary padding | Clip  so search crop stays within frame; adapt center when near boundary |
+| Window overcorrection | Reduce  from 0.42 → 0.15–0.20 for fast-moving targets |
+| False target | Consequence of above; fix drift first |
 
 
 ## References
