@@ -215,6 +215,7 @@ DATASET:
     TEMPLATE:
         SHIFT: 4
         SCALE: 0.10
+        SCALE_ONE_SIDED: True   # only shrink target, never enlarge
         BLUR: 0.2
         FLIP: 0.5
         COLOR: 0.0      # PCA jitter disabled — IR not RGB
@@ -222,6 +223,7 @@ DATASET:
     SEARCH:
         SHIFT: 64
         SCALE: 0.5
+        SCALE_ONE_SIDED: True   # only shrink target, never enlarge
         BLUR: 0.3
         FLIP: 0.5
         COLOR: 0.0      # PCA jitter disabled — IR not RGB
