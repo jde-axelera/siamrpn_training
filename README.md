@@ -34,7 +34,8 @@ Built on [PySOT](https://github.com/STVIR/pysot). Designed to run on AWS GPU ins
 24. [Tracker Failure Analysis — ir_crop.mp4](#24-tracker-failure-analysis--ir_cropmp4)
 25. [Small-Object Tracker Training — Scale-Drop Approach](#25-small-object-tracker-training--scale-drop-approach)
 26. [Stage 2: 3-Stage IR Backbone Training Pipeline](#26-stage-2-3-stage-ir-backbone-training-pipeline)
-27. [ONNX Export, Validation \& Tracking Failure Analysis](#27-onnx-export-validation--tracking-failure-analysis)
+27. [ONNX Export, Validation & Tracking Failure Analysis](#27-onnx-export-validation--tracking-failure-analysis)
+28. [Particle Filter Tracker — SiamRPN++ + PF](#28-particle-filter-tracker--siamrpn--pf)
 
 ---
 
@@ -2600,3 +2601,134 @@ torchrun --nproc_per_node=4 --master_port=29502 train_stage2_siamese.py \
 
 All scripts support `--resume` via automatic checkpoint detection and log to
 `stage{0,1,2}_*.log`.
+
+---
+
+## 28. Particle Filter Tracker — SiamRPN++ + PF
+
+### Motivation
+
+Pure SiamRPN++ has two structural weaknesses exposed by the `ir_crop.mp4` test sequence:
+
+| Issue | Root cause | Symptom |
+|-------|-----------|---------|
+| **Bounding-box shrinkage** | One-sided scale augmentation biases the regression head to under-predict size | Box collapses to 10 px minimum in ~300 frames |
+| **Distractor lock-on** | Tiny search window (≈49 px) caused by collapsed bbox lands on road markings / sky | High score, high PSR — but tracking wrong object |
+
+The particle filter addresses both by maintaining an **ensemble of hypotheses** and separating *position estimation* (PF) from *appearance matching* (SiamRPN++).
+
+---
+
+### Architecture
+
+![PF architecture block diagram](docs/pf_architecture.png)
+
+#### Pure SiamRPN++ (baseline)
+```
+Frame t  +  Template (frozen or PSR-adapted)
+     │
+  ResNet-50 IR Backbone  →  AdjustLayer
+     │
+  MultiRPN Head  →  cls_raw (1,10,25,25)  ·  loc_raw (1,20,25,25)
+     │
+  Cosine window  +  anchor decode
+     │
+  best_score  ·  bbox  →  center_pos update (LR=0.38)
+     │
+  [Optional] PSR-gated template blend (PSR > 6.0, α=0.25)
+```
+
+#### SiamRPN++ + Particle Filter
+```
+Frame t  +  Template
+     │
+  ResNet-50 IR Backbone  →  AdjustLayer
+     │
+  MultiRPN Head  →  cls_raw  ·  loc_raw
+           │                       │
+    score_map (25×25)         bbox regression
+    (max over anchors)        (size with caps)
+           │
+    Particle Likelihood
+    wᵢ ∝ exp(score_map[fxᵢ,fyᵢ] / τ)
+    [PSR gate: skip if PSR < 2.0]
+           │
+    Systematic Resample (ESS < N/2)
+           │
+    Weighted-mean position  +  SiamRPN++ size
+           │
+    center_pos override  →  next frame search crop
+           │
+    [PSR-gated template blend: PSR > 6.0, score > 0.55, α=0.25]
+```
+
+#### Key difference
+SiamRPN++ alone updates its position estimate by finding the **single peak** of the score map. The particle filter maintains **N=500 weighted hypotheses** that evolve via a motion model and are re-weighted by the same score map. This makes the estimate robust to:
+- Momentary low-confidence frames (particles coast on momentum)
+- Distractors with diffuse responses (PSR gate rejects flat maps)
+
+---
+
+### Hyper-parameters
+
+| Parameter | Value | Role |
+|-----------|-------|------|
+| `N_PARTICLES` | 500 | Number of state hypotheses |
+| `SIGMA_POS` | 4.0 px/frame | Position diffusion noise |
+| `SIGMA_VEL` | 1.5 px/frame² | Velocity diffusion noise |
+| `SIGMA_SCALE` | 0.02 | Relative size noise (log-normal) |
+| `MAX_VEL` | 25 px/frame | Velocity clamp |
+| `TAU` | 0.15 | Likelihood temperature |
+| `ROUGHEN_STD` | 0.5 px | Post-resample jitter |
+| `TMPL_FREQ` | 30 frames | Template update interval |
+| `TMPL_ALPHA` | 0.25 | Template blend weight |
+| `TMPL_PSR` | 6.0 | PSR threshold for template update |
+
+---
+
+### Feature-map coordinate formula
+
+Particles live in image space. To look up their score on the 25×25 feature map:
+
+```
+PySOT anchor cell (i,j) maps to search-patch pixel: 31.5 + i×8
+Inverse: i = (search_px − 31.5) / 8
+
+scale  = 255 / s_x
+sx_p   = (px − cx_search) × scale + 127.5
+fx     = clip((sx_p − 31.5) / 8, 0, 24)
+```
+
+---
+
+### Running the tracker
+
+```bash
+cd /data/siamrpn_training
+python3 track_pf.py
+# Output: ir_v2_pf.mp4  (4-panel: PF bbox + particles | score map | search crop | SAM2)
+```
+
+Comparison video (PF vs pure SiamRPN++):
+```
+ir_pf_vs_siamrpn.mp4
+```
+
+---
+
+### Output panels
+
+| Panel | Content |
+|-------|---------|
+| 1 | Original frame · green PF bbox · orange search region · yellow particle cloud (top 50) |
+| 2 | 25×25 score map (JET colormap) · white dots = particle positions · PSR + ESS readout |
+| 3 | 255×255 search crop (normalised) · s_x readout |
+| 4 | SAM2 segmentation reference |
+
+---
+
+### Limitations & next steps
+
+- **Global re-detection**: once particles drift far from the target (e.g. sky lock-on), the filter cannot recover without a global scan. A lightweight detector or periodic exhaustive scan would address this.
+- **Training data**: adding LSOTB-TIR and DroneVehicle (aerial IR road scenes) as hard-negative training sequences would reduce road-marking / sky distractors at the SiamRPN++ level.
+- **Rotation augmentation**: currently a TODO in `pysot/datasets/augmentation.py`; would improve robustness to target roll changes.
