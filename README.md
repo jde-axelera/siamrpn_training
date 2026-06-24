@@ -31,8 +31,10 @@ Working layout on the server:
 
 ```
 /home/ubuntu/data/siamrpn_training/
-├── train_siamrpn_aws.py
+├── train_siamrpn_aws.py                  # training entry point
+├── launch_train.sh                       # exact 8-GPU DDP launch command (§5.3)
 ├── configs/config_ir_siamese.yaml
+├── scripts/                              # helpers: data prep, ONNX export, eval, monitor
 ├── pretrained/sot_resnet50.pth          # backbone init
 ├── data/                                 # ~247 GB, see §3
 └── pysot/
@@ -114,7 +116,7 @@ Each dataset must be converted to the **PySOT SubDataset JSON** schema:
 For Anti-UAV410, use the included converter:
 
 ```bash
-python convert_antiuav410.py \
+python scripts/convert_antiuav410.py \
     --data_root /home/ubuntu/data/siamrpn_training/data/anti_uav410 \
     --splits train val
 ```
@@ -132,7 +134,7 @@ The training script picks up `<root>/<split>_pysot.json` automatically per the p
 
 ## 3. Configuration
 
-The full cfg is at [config_ir_siamese.yaml](config_ir_siamese.yaml). Key hyperparameters used in the 444-epoch run:
+The full cfg is at [configs/config_ir_siamese.yaml](configs/config_ir_siamese.yaml). Key hyperparameters used in the 444-epoch run:
 
 ### Model
 
@@ -221,7 +223,7 @@ Plus the global probabilities:
 ### 4.5 Verify augmentation before launch
 
 ```bash
-python debug_dataflow.py        # 2-minute pre-flight: visualizes training pairs
+python scripts/debug_dataflow.py        # 2-minute pre-flight: visualizes training pairs
 ```
 
 Skipping this once cost a full 140-epoch run. **Never skip it.** Visualised pairs catch preprocessing bugs that would otherwise be invisible until epoch 100+.
@@ -306,8 +308,8 @@ TensorBoard logs at `pysot/logs/all_datasets_ir_siamese/` — start with `tensor
 
 These three rules come from a session that produced a model with loss 0.26 and IoU=0.000 on training data — caught only because the user manually tested mid-training.
 
-1. **Visualize training pairs** — `python debug_dataflow.py`. 2 minutes. Catches preprocessing bugs immediately.
-2. **Test on training data at ~20 epochs** — `python test_on_training_data.py`. If IoU=0.000, stop. Loss alone tells you nothing about tracking quality.
+1. **Visualize training pairs** — `python scripts/debug_dataflow.py`. 2 minutes. Catches preprocessing bugs immediately.
+2. **Test on training data at ~20 epochs** — run a quick tracking check on a few training sequences and inspect IoU (no bundled script — use the exported model with the inference scripts in `scripts/`). If IoU=0.000, stop. Loss alone tells you nothing about tracking quality.
 3. **Low loss ≠ correct training** — a model can memorize spurious correlations and still produce a healthy-looking loss curve. Correct training starts at loss ≈ 1.7 and decreases. A run that starts at 0.26 is suspicious, not impressive.
 
 ---
@@ -316,9 +318,9 @@ These three rules come from a session that produced a model with loss 0.26 and I
 
 1. Provision an 8× A100 box, install the `siamrpn` conda env.
 2. Copy `data/anti_uav410/` and `data/dut_vtuav/` to `/home/ubuntu/data/siamrpn_training/data/` (~241 GB combined).
-3. Run `convert_antiuav410.py` and DUT-VTUAV's converter to produce `*_pysot.json`.
+3. Run `scripts/convert_antiuav410.py` and DUT-VTUAV's converter to produce `*_pysot.json`.
 4. Place `sot_resnet50.pth` at `pretrained/`.
-5. Run `python debug_dataflow.py` and inspect the dumped pairs.
+5. Run `python scripts/debug_dataflow.py` and inspect the dumped pairs.
 6. Run `python train_siamrpn_aws.py --smoke-test ...` and confirm a clean 1-epoch loop.
 7. Launch the full 8-GPU command from §5.3 inside a tmux session.
 8. Monitor TensorBoard; expect best val loss around epoch ~440 at ~0.318.

@@ -100,8 +100,8 @@ def main():
 
     # ── load model ────────────────────────────────────────────────────────────
     model = ModelBuilder().eval()
-    ckpt = torch.load(args.ckpt, map_location="cpu")
-    state = ckpt.get("state_dict", ckpt)
+    ckpt = torch.load(args.ckpt, map_location="cpu", weights_only=False)
+    state = ckpt.get("state_dict", ckpt.get("model", ckpt))
     model.load_state_dict(state, strict=True)
     print(f"Loaded checkpoint: {args.ckpt} (epoch {ckpt.get('epoch','?')}, "
           f"val_loss={ckpt.get('val_loss', '?')})")

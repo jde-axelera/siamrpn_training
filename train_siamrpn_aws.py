@@ -902,6 +902,10 @@ def main():
     parser.add_argument("--resume",     default="",
                         help="Full checkpoint .pth to resume from")
     parser.add_argument("--seed",       type=int, default=42)
+    parser.add_argument("--no_early_stop", action="store_true",
+                        help="Run all EPOCH epochs — no early stopping")
+    parser.add_argument("--no_plateau",    action="store_true",
+                        help="Use fixed log-decay LR — no ReduceLROnPlateau")
     parser.add_argument("--smoke-test", action="store_true",
                         help=(
                             "Run a single epoch with a tiny dataset slice "
@@ -1122,6 +1126,24 @@ def main():
 
     # ── schedulers (built after resume so fast-forward is correct) ────────────
     primary_sched, plateau_sched = build_schedulers(optimizer, cfg, start_epoch)
+    if args.no_plateau:
+        import numpy as _np
+        _w = _np.linspace(cfg.TRAIN.BASE_LR * 0.02, cfg.TRAIN.BASE_LR, 5)
+        _d = _np.logspace(
+            _np.log10(cfg.TRAIN.BASE_LR),
+            _np.log10(cfg.TRAIN.LR.KWARGS.get("end_lr", 1e-5)),
+            max(1, cfg.TRAIN.EPOCH - 5))
+        _lrs = list(_w) + list(_d)
+        class _LogSched:
+            def step(self, epoch):
+                idx = min(int(epoch), len(_lrs) - 1)
+                lr  = _lrs[idx]
+                for pg in optimizer.param_groups:
+                    pg["lr"] = lr * pg.get("lr_scale", 1.0)
+                return lr
+        primary_sched = _LogSched()
+        logger.info(f"  [LR] Log-decay schedule: {cfg.TRAIN.BASE_LR:.2e} → "
+                    f"{_lrs[-1]:.2e} over {cfg.TRAIN.EPOCH} epochs")
     if plateau_state is not None:
         plateau_sched.load_state_dict(plateau_state)
         logger.info("  Restored ReduceLROnPlateau state from checkpoint.")
@@ -1171,7 +1193,8 @@ def main():
         val_loss   = run_epoch(model, val_loader,   device, optimizer=None, epoch=epoch)
 
         # ── step plateau rescue AFTER observing val_loss ──────────────────────
-        plateau_sched.step(val_loss)
+        if not args.no_plateau:
+            plateau_sched.step(val_loss)
         lr_after = optimizer.param_groups[0]["lr"]
 
         # Detect and log if plateau scheduler fired (LR changed from its action)
@@ -1249,7 +1272,7 @@ def main():
             logger.info(f"★ New best model (val={val_loss:.4f}) saved: {best_ckpt}")
 
         # ── early stopping — skipped in smoke-test mode
-        if not args.smoke_test and should_stop:
+        if not args.smoke_test and not args.no_early_stop and should_stop:
             early_stopping.stopped_epoch = epoch + 1
             logger.info("")
             logger.info("=" * 60)
