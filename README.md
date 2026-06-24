@@ -132,7 +132,7 @@ The training script picks up `<root>/<split>_pysot.json` automatically per the p
 
 ## 3. Configuration
 
-The full cfg is at [config_ir_siamese.yaml](config_ir_siamese.yaml). Key hyperparameters used in the 444-epoch run:
+The full cfg is at [configs/config_ir_siamese.yaml](configs/config_ir_siamese.yaml). Key hyperparameters used in the 444-epoch run:
 
 ### Model
 
