@@ -79,6 +79,8 @@ scp -r -i "<key>" ubuntu@<ip>:/home/ubuntu/data/siamrpn_training/data/anti_uav41
 scp -r -i "<key>" ubuntu@<ip>:/home/ubuntu/data/siamrpn_training/data/dut_vtuav/   ./data/
 ```
 
+> **Note — how DUT-VTUAV was processed for the 444-epoch run.** Only DUT-VTUAV's **train partition (250 sequences)** was downloaded; the official **test partition (~250 more sequences** of the full 500-sequence dataset) was **not** downloaded. `scripts/extract_dutvtuav.sh` only ever unzips `train_*.zip`. Those 250 sequences were then split **90/10 locally** into `train/` (~225 seqs → `train_pysot.json`, the 52,640 boxes in §2.1) and `test/` (~25 seqs → `test_pysot.json`); see `scripts/split_and_report_dutvtuav.py`. So `dut_vtuav/test` here is a held-out slice of the downloaded train partition — **not** the official DUT-VTUAV benchmark test split.
+
 ### 2.4 Expected on-disk layout
 
 ```
