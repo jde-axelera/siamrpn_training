@@ -899,6 +899,11 @@ def main():
     parser.add_argument("--cfg",        required=True)
     parser.add_argument("--pretrained", default="",
                         help="Pretrained backbone .pth (sot_resnet50)")
+    parser.add_argument("--init_full_model", default="",
+                        help="Optional: full SiamRPN++ .pth (backbone+neck+RPN) to "
+                             "warm-start from, e.g. a pysot MODEL_ZOO "
+                             "siamrpn_r50_l234_dwxcorr.pth. Overrides --pretrained. "
+                             "Requires the same anchor_num (5); anchor ratios may differ.")
     parser.add_argument("--resume",     default="",
                         help="Full checkpoint .pth to resume from")
     parser.add_argument("--seed",       type=int, default=42)
@@ -954,10 +959,17 @@ def main():
     # ── model ─────────────────────────────────────────────────────────────────
     model = ModelBuilder()
 
-    pretrained = args.pretrained or cfg.TRAIN.PRETRAINED
-    if pretrained and os.path.isfile(pretrained):
-        logger.info(f"Loading pretrained backbone: {pretrained}")
-        load_pretrain(model.backbone, pretrained)
+    if args.init_full_model and os.path.isfile(args.init_full_model):
+        # Warm-start the WHOLE model (backbone + neck + RPN), e.g. from a pysot
+        # MODEL_ZOO checkpoint. Safe as long as anchor_num matches (head conv
+        # shapes depend on anchor_num, not on the anchor ratios).
+        logger.info(f"Loading FULL model (backbone+neck+RPN): {args.init_full_model}")
+        load_pretrain(model, args.init_full_model)
+    else:
+        pretrained = args.pretrained or cfg.TRAIN.PRETRAINED
+        if pretrained and os.path.isfile(pretrained):
+            logger.info(f"Loading pretrained backbone: {pretrained}")
+            load_pretrain(model.backbone, pretrained)
 
     # freeze backbone; layers unlock after BACKBONE_TRAIN_EPOCH
     for p in model.backbone.parameters():
