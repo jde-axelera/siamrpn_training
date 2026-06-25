@@ -281,11 +281,49 @@ torchrun --nproc_per_node=8 train_siamrpn_aws.py \
 |---|---|
 | `--cfg PATH` | Required. YAML config path. |
 | `--pretrained PATH` | Backbone init checkpoint. Overrides `cfg.TRAIN.PRETRAINED`. |
+| `--init_full_model PATH` | Optional. Warm-start the **whole** model (backbone+neck+RPN) from a full SiamRPN++ checkpoint (e.g. a MODEL_ZOO `.pth`). Overrides `--pretrained`. See §5.6. |
 | `--resume PATH` | Full checkpoint to resume from (model + optimizer + epoch). |
 | `--seed N` | RNG seed (default 42). Per-rank offset is added in DDP. |
 | `--no_early_stop` | Run all `cfg.TRAIN.EPOCH` epochs regardless of stagnation. |
 | `--no_plateau` | Skip ReduceLROnPlateau rescue; use fixed log decay only. |
 | `--smoke-test` | 1 epoch, 64-sample slice. |
+
+### 5.6 Weight initialization
+
+**Default (the 444-epoch run):** only the **ResNet-50 backbone** is initialized — from
+`pretrained/sot_resnet50.pth` (the OpenMMLab MMTracking `sot_resnet50` SOT backbone, an
+ImageNet-derived ResNet-50). The **neck (`AdjustAllLayer`) and RPN head (`MultiRPN`) start
+from random init** and are trained from scratch. Both `cfg.TRAIN.PRETRAINED` and
+`cfg.BACKBONE.PRETRAINED` are empty — the backbone init comes only from `--pretrained`.
+The backbone is frozen for the first `BACKBONE.TRAIN_EPOCH` (10) epochs, then fine-tuned.
+
+**Optional — warm-start the whole model from the pysot MODEL_ZOO.** Instead of random
+neck+RPN, you can initialize the entire network from a trained SiamRPN++ checkpoint
+([pysot MODEL_ZOO](https://github.com/STVIR/pysot/blob/master/MODEL_ZOO.md)):
+
+```bash
+# Download the matching-architecture model (siamrpn_r50_l234_dwxcorr), then:
+torchrun --nproc_per_node=8 train_siamrpn_aws.py \
+    --cfg configs/config_ir_siamese.yaml \
+    --init_full_model pretrained/siamrpn_r50_l234_dwxcorr.pth \
+    --no_early_stop
+```
+
+`--init_full_model` loads backbone **+ neck + RPN** (it overrides `--pretrained`).
+
+> **Why this is safe with our different anchor ratios.** The RPN head conv shapes depend
+> only on `ANCHOR.ANCHOR_NUM` (`cls = 2·anchor_num`, `loc = 4·anchor_num`), **not** on the
+> ratios — ratios are used only for anchor generation, target assignment, and decode, never
+> in the network weights. Our config and `siamrpn_r50_l234_dwxcorr` both use `anchor_num: 5`,
+> so all weights are shape-identical and load cleanly. The loaded RPN was tuned for the zoo
+> ratios (`0.33,0.5,1,2,3`) vs ours (`0.37,0.56,0.79,1.11,2.26`); since both lists are sorted
+> ascending and the RPN is fine-tuned (not frozen), it adapts within a few epochs — still a
+> much better start than random.
+>
+> **Caveats:** (1) the zoo model is **RGB-trained**, so the IR domain shift matters more than
+> the ratio mismatch. (2) This only works while `anchor_num` stays 5 — if you change the
+> **number** of anchors, the head conv shapes change and `load_state_dict(strict=False)` will
+> raise; you'd then need to filter the `rpn_head` keys and let only backbone+neck load.
 
 ---
 
