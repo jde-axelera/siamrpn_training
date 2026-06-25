@@ -170,6 +170,25 @@ The full cfg is at [configs/config_ir_siamese.yaml](configs/config_ir_siamese.ya
 - `NEG: 0.4` — 40% of pairs are negatives (template and search from different sequences) to learn distractor rejection.
 - `GRAY: 0.5` — half the pairs run through BGR→GRAY→BGR replication, randomizing the 1ch↔3ch path.
 
+### Deriving anchor ratios (`scripts/analyze_anchors.py`)
+
+The `ANCHOR.RATIOS` above are **data-driven**, not the pysot defaults. They were computed by
+KMeans-5 over bbox h/w (log-space) across the IR datasets:
+
+```bash
+python scripts/analyze_anchors.py --data_root /home/ubuntu/data/siamrpn_training/data
+# 288,320 bboxes → median h/w 0.736 → RATIOS = [0.37, 0.56, 0.79, 1.11, 2.26]
+```
+
+Re-run this **only if you add/swap datasets** or otherwise change the target-shape
+distribution, then paste the printed ratios into `ANCHOR.RATIOS` in
+`configs/config_ir_siamese.yaml`. The stock `siamrpn_r50_l234_dwxcorr` ratios
+(`0.33,0.5,1,2,3`) are **not** used here.
+
+> Keep `ANCHOR.ANCHOR_NUM` at **5** if you intend to warm-start from a MODEL_ZOO checkpoint
+> (§5.6) — changing the *number* of anchors changes the RPN head shape; changing only the
+> *ratios* does not.
+
 ---
 
 ## 4. Augmentation pipeline
